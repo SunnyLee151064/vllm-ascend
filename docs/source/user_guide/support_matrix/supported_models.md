@@ -32,6 +32,14 @@
 | XLM-RoBERTa-based | ✅ |  |
 | Molmo | ✅ |  |
 
+### Embedding Models
+| Model | Supported | Note |
+|-------|---------|------|
+| bge-large-zh-v1.5 | ✅ |  |
+| bge-reranker-large | ✅ |  |
+| bge-m3 | ✅ |  |
+
+
 
 ## Multimodal Language Models
 
