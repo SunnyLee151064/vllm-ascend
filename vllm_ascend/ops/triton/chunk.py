@@ -19,8 +19,9 @@ from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
 from .solve_tril import solve_tril
-from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL, input_guard
+from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 from .wy_fast import recompute_w_u_fwd
+from .utils import input_guard
 
 
 def chunk_gated_delta_rule_fwd(q: torch.Tensor,
