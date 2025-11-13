@@ -9,6 +9,7 @@
 import torch
 import torch.nn.functional as F
 from vllm.triton_utils import tl, triton
+from typing import Optional
 
 MAX_CORES = 65535
 
