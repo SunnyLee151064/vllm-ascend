@@ -3258,7 +3258,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache between the self_attn specs in the same group
                         if "linear_attn" in layer_name_inner:
-                            kv_cache_raw_tensors[layer_name_inner] = tensor
+                            kv_cache_raw_tensors[layer_name_inner] = tensor.contiguous()
                 elif "attn" in layer_name and layer_name not in kv_cache_raw_tensors.keys(
                 ):
                     # NOTE: We need to init k cache tensor (nope cache tensor in mla) and
@@ -3484,7 +3484,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             size=target_shape,
                             stride=target_stride,
                             storage_offset=storage_offset_bytes // dtype_size,
-                        )
+                        ).contiguous()
                         state_tensors.append(tensor)
                         storage_offset_bytes += stride[0] * dtype_size
                     kv_caches[layer_name] = state_tensors
