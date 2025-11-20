@@ -22,6 +22,7 @@ from .solve_tril import solve_tril
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 from .wy_fast import recompute_w_u_fwd
 from .utils import input_guard
+from vllm_ascend.ops.fla import l2norm_fwd_new
 
 
 def chunk_gated_delta_rule_fwd(q: torch.Tensor,
@@ -89,8 +90,10 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 cu_seqlens: Optional[torch.LongTensor] = None,
                 use_qk_l2norm_in_kernel: bool = False):
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            # q = l2norm_fwd(q)
+            # k = l2norm_fwd(k)
+            q = l2norm_fwd_new(q)
+            k = l2norm_fwd_new(k)
 
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,

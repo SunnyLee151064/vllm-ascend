@@ -831,7 +831,7 @@ def l2norm_fwd_kernel2_loop(X, Y, eps, M, N: tl.constexpr,
 
 
 # 把这个算子替换进torch_chunk_gated_delta_rule
-def l2norm_fwd(
+def l2norm_fwd_new(
     x: torch.Tensor, eps: float = 1e-6, output_dtype: torch.dtype | None = None
 ):
     x_shape_og = x.shape
