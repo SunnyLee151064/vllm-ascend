@@ -261,13 +261,25 @@ class CustomQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet, MambaBase):
         # projection of the input hidden states
         self.projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
         self.projection_size_ba = self.num_v_heads * 2
-        self.in_proj = MergedColumnParallelLinear(
+        # self.in_proj = MergedColumnParallelLinear(
+        #     input_size=self.hidden_size,
+        #     output_sizes=[self.projection_size_qkvz, self.projection_size_ba],
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=f"{prefix}.in_proj",
+        # )
+        self.in_proj_qkvz = ColumnParallelLinear(
             input_size=self.hidden_size,
-            output_sizes=[self.projection_size_qkvz, self.projection_size_ba],
+            output_size=self.projection_size_qkvz,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.in_proj",
         )
+        self.in_proj_ba = ColumnParallelLinear(
+            input_size=self.hidden_size,
+            output_size=self.projection_size_ba,
+            bias=False,
+            quant_config=quant_config,
+         )
 
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -356,18 +368,20 @@ class CustomQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet, MambaBase):
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
         # 1. Set up dimensions for reshapes later
-        projected_states, _ = self.in_proj(hidden_states[:num_actual_tokens])
-        if vllm_version_is("0.11.0"):
-            if spec_token_masks is not None:
-                spec_token_masks = spec_token_masks[:num_actual_tokens]
-        projected_states_qkvz, projected_states_ba = torch.split(
-            projected_states,
-            [
-                self.projection_size_qkvz // self.tp_size,
-                self.projection_size_ba // self.tp_size
-            ],
-            dim=-1,
-        )
+        # projected_states, _ = self.in_proj(hidden_states[:num_actual_tokens])
+        # if vllm_version_is("0.11.0"):
+        #     if spec_token_masks is not None:
+        #         spec_token_masks = spec_token_masks[:num_actual_tokens]
+        # projected_states_qkvz, projected_states_ba = torch.split(
+        #     projected_states,
+        #     [
+        #         self.projection_size_qkvz // self.tp_size,
+        #         self.projection_size_ba // self.tp_size
+        #     ],
+        #     dim=-1,
+        # )
+        projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states[:num_actual_tokens])
+        projected_states_ba, _ = self.in_proj_ba(hidden_states[:num_actual_tokens])
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and self.is_cuda_graph:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
@@ -807,9 +821,10 @@ class CustomQwen3NextModel(Qwen3NextModel):
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
-            ("in_proj", "in_proj_qkvz", 0),
-            ("in_proj", "in_proj_ba", 1),
         ]
+        #     ("in_proj", "in_proj_qkvz", 0),
+        #     ("in_proj", "in_proj_ba", 1),
+        # ]
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
