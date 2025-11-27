@@ -389,7 +389,9 @@ class CustomQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet, MambaBase):
         # )
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states[:num_actual_tokens])
         projected_states_ba, _ = self.in_proj_ba(hidden_states[:num_actual_tokens])
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and self.is_cuda_graph:
+        # triton grid should be less than 66536
+        divide_grid=projected_states_qkvz.shape[0]*triton.cdiv(self.num_k_heads, self.tp_size)
+        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and self.is_cuda_graph and divide_grid < 65536:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
