@@ -28,7 +28,7 @@ from vllm.model_executor.layers.rotary_embedding import (
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import enable_custom_op, is_310p
 from vllm_ascend.ops.triton.rope import rope_forward_triton
-from vllm.triton_utils import HAS_TRITO
+from vllm.triton_utils import HAS_TRITON
 
 def _custom_rotary_embedding_enabled(query, neox_style, head_size):
     return query.dtype == torch.float16 and neox_style and head_size % 32 == 0 and enable_custom_op(
@@ -67,8 +67,7 @@ def _rope_forward_oot(
         if self.cos is not None and self.sin is not None:
 
             if self.head_size == 128 and self.cos_sin_cache.shape[-1] == 128 :
-                query = query.contiguous().view(1, query.shape[0], -1
-                                            self.head_size)
+                query = query.contiguous().view(1, query.shape[0], -1, self.head_size)
                 key = key.contiguous().view(1, key.shape[0], -1, self.head_size)
                 # If cos and sin are generated outside, use npu_apply_rotary_pos_emb to avoid redundant calculation.
                 # This method requires head_size and rotary_dim equal 128 and neox_style is True
