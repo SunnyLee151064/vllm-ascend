@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
                              DraftTokenIds, ModelRunnerOutput)
 from vllm.v1.worker.worker_base import WorkerBase
-
+from vllm_ascend.ops.triton.utils import init_device_properties_triton
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.cpu_binding import bind_cpus
@@ -214,6 +214,8 @@ class NPUWorker(WorkerBase):
         self._init_worker_distributed_environment()
         # Set random seed.
         NPUPlatform.seed_everything(self.model_config.seed)
+        # Initialize device properties used by triton kernels.
+        init_device_properties_triton()
         return device
 
     def init_device(self):
