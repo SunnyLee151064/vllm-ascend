@@ -10,7 +10,7 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 from vllm import envs
-from vllm.attention import Attention, AttentionBackend, AttentionMetadata
+from vllm.attention import AttentionBackend, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (CacheConfig, ModelConfig, SpeculativeConfig,
                          CUDAGraphMode, VllmConfig, get_current_vllm_config)
@@ -28,7 +28,6 @@ from vllm.model_executor.layers.layernorm import \
     GemmaRMSNorm as Qwen3NextRMSNorm
 # yapf: enable
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               QKVParallelLinear,
                                                MergedColumnParallelLinear,
                                                RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -40,7 +39,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn, causal_conv1d_update)
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
@@ -62,12 +60,8 @@ from vllm.model_executor.models.qwen3_next import (  # isort: skip
 from vllm_ascend.ops.fla import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.fused_gdn_gating import fused_gdn_gating
 
-import torch_npu
-import torch_npu._inductor
-
 import triton
 import triton.language as tl
-import triton.runtime.driver as driver
 
 
 @triton.jit
@@ -708,360 +702,6 @@ class CustomQwen3NextGatedDeltaNet(Qwen3NextGatedDeltaNet, MambaBase):
         output[:num_actual_tokens], _ = self.out_proj(core_attn_out)
 
 
-def get_npu_properties():
-    device = torch.npu.current_device()
-    return driver.active.utils.get_device_properties(device)
-
-num_core = get_npu_properties()["num_vectorcore"]
-
-@triton.jit
-def qk_rmsnorm_triton_kernel(
-    input_ptr,
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    batch_size,
-    q_hidden_size,
-    kv_hidden_size,
-    total_hidden_size,
-    eps,
-    Q_BLOCK_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    row_pid = tl.program_id(0)
-    col_pid = tl.program_id(1)
-    row_step = tl.num_programs(0)
-
-    # q norm
-    weight_values = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM))
-    input_offset = row_pid * total_hidden_size
-    output_offset = row_pid * q_hidden_size
-    input_offset_step = row_step * total_hidden_size
-    output_offset_step = row_step * q_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        col_indices = col_pid * Q_BLOCK_SIZE + tl.arange(0, Q_BLOCK_SIZE)
-        valid_mask = col_indices < q_hidden_size
-        input_values = tl.load(
-            input_ptr + input_offset + col_indices, mask=valid_mask, other=0.0
-        ).to(tl.float32).reshape(Q_BLOCK_SIZE//HEAD_DIM, HEAD_DIM)
-        squares = input_values * input_values
-        variances = tl.sum(squares, axis=1) / HEAD_DIM
-        reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(Q_BLOCK_SIZE//HEAD_DIM, 1)
-        normalized_values = input_values * reciprocal_std
-        output_values = normalized_values.to(tl.bfloat16) * (1.0 + weight_values)
-        tl.store(q_ptr + output_offset + col_indices, output_values.reshape(Q_BLOCK_SIZE), mask=valid_mask)
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-    # k norm
-    weight_values = tl.load(k_weight_ptr + tl.arange(0, HEAD_DIM))
-    input_offset = row_pid * total_hidden_size + q_hidden_size
-    output_offset = row_pid * kv_hidden_size
-    output_offset_step = row_step * kv_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        col_indices = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
-        valid_mask = col_indices < kv_hidden_size
-        input_values = tl.load(
-            input_ptr + input_offset + col_indices, mask=valid_mask, other=0.0
-        ).to(tl.float32).reshape(KV_BLOCK_SIZE//HEAD_DIM, HEAD_DIM)
-        squares = input_values * input_values
-        variances = tl.sum(squares, axis=1) / HEAD_DIM
-        reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(KV_BLOCK_SIZE//HEAD_DIM, 1)
-        normalized_values = input_values * reciprocal_std
-        output_values = normalized_values.to(tl.bfloat16) * (1.0 + weight_values)
-        tl.store(k_ptr + output_offset + col_indices, output_values.reshape(KV_BLOCK_SIZE), mask=valid_mask)
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-    # v copy
-    input_offset = row_pid * total_hidden_size + q_hidden_size + kv_hidden_size
-    output_offset = row_pid * kv_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        col_indices = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
-        valid_mask = col_indices < kv_hidden_size
-        input_values = tl.load(
-            input_ptr + input_offset + col_indices, mask=valid_mask, other=0.0
-        )
-        tl.store(v_ptr + output_offset + col_indices, input_values, mask=valid_mask)
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-
-@triton.jit
-def qk_rmsnorm_gate_triton_kernel(
-    input_ptr,
-    q_ptr,
-    gate_ptr,
-    k_ptr,
-    v_ptr,
-    q_weight_ptr,
-    k_weight_ptr,
-    batch_size,
-    q_hidden_size,
-    kv_hidden_size,
-    total_hidden_size,
-    eps,
-    Q_GATE_BLOCK_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    row_pid = tl.program_id(0)
-    col_pid = tl.program_id(1)
-    row_step = tl.num_programs(0)
-
-    # q_gate = q norm + gate copy
-    weight_values = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM))
-    input_offset = row_pid * total_hidden_size
-    output_offset = row_pid * q_hidden_size
-    input_offset_step = row_step * total_hidden_size
-    output_offset_step = row_step * q_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        # [Head0 q, Head0 gate, Head1 q, Head1 gate, ......] ->
-        # [Head0 q, Head1 q, ......], [Head0 gate, Head1 gate, ......]
-        # load
-        start_indices = tl.arange(0, Q_GATE_BLOCK_SIZE // HEAD_DIM) * (HEAD_DIM * 2)
-        indices_per_head_q = start_indices[:, None] + tl.arange(0, HEAD_DIM)[None, :]
-        indices_per_head_gate = start_indices[:, None] + tl.arange(HEAD_DIM, HEAD_DIM * 2)[None, :]
-        col_indices_q = col_pid * Q_GATE_BLOCK_SIZE * 2 + indices_per_head_q.reshape(Q_GATE_BLOCK_SIZE)
-        col_indices_gate = col_pid * Q_GATE_BLOCK_SIZE * 2 + indices_per_head_gate.reshape(Q_GATE_BLOCK_SIZE)
-        valid_mask_q = col_indices_q < q_hidden_size * 2
-        valid_mask_gate = col_indices_gate < q_hidden_size * 2
-
-        input_values_q = tl.load(
-            input_ptr + input_offset + col_indices_q, mask=valid_mask_q, other=0.0
-        ).to(tl.float32).reshape(Q_GATE_BLOCK_SIZE//HEAD_DIM, HEAD_DIM)
-        input_values_gate = tl.load(
-            input_ptr + input_offset + col_indices_gate, mask=valid_mask_gate, other=0.0
-        )
-
-        # norm
-        squares = input_values_q * input_values_q
-        variances = tl.sum(squares, axis=1) / HEAD_DIM
-        reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(Q_GATE_BLOCK_SIZE//HEAD_DIM, 1)
-        normalized_values = input_values_q * reciprocal_std
-        # output_values_q = normalized_values * (1.0 + weight_values.to(tl.float32))
-        output_values_q = normalized_values.to(tl.bfloat16) * (1.0 + weight_values)
-
-        # store
-        col_indices = col_pid * Q_GATE_BLOCK_SIZE + tl.arange(0, Q_GATE_BLOCK_SIZE)
-        valid_mask = col_indices < q_hidden_size
-        tl.store(q_ptr + output_offset + col_indices, output_values_q.reshape(Q_GATE_BLOCK_SIZE), mask=valid_mask)
-        tl.store(gate_ptr + output_offset + col_indices, input_values_gate, mask=valid_mask)
-
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-    # k norm
-    weight_values = tl.load(k_weight_ptr + tl.arange(0, HEAD_DIM))
-    input_offset = row_pid * total_hidden_size + q_hidden_size * 2
-    output_offset = row_pid * kv_hidden_size
-    output_offset_step = row_step * kv_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        col_indices = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
-        valid_mask = col_indices < kv_hidden_size
-        input_values = tl.load(
-            input_ptr + input_offset + col_indices, mask=valid_mask, other=0.0
-        ).to(tl.float32).reshape(KV_BLOCK_SIZE//HEAD_DIM, HEAD_DIM)
-        squares = input_values * input_values
-        variances = tl.sum(squares, axis=1) / HEAD_DIM
-        reciprocal_std = (1 / tl.sqrt(variances + eps)).reshape(KV_BLOCK_SIZE//HEAD_DIM, 1)
-        normalized_values = input_values * reciprocal_std
-        # output_values = normalized_values * (1.0 + weight_values.to(tl.float32))
-        output_values = normalized_values.to(tl.bfloat16) * (1.0 + weight_values)
-        tl.store(k_ptr + output_offset + col_indices, output_values.reshape(KV_BLOCK_SIZE), mask=valid_mask)
-
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-    # v copy
-    input_offset = row_pid * total_hidden_size + q_hidden_size * 2 + kv_hidden_size
-    output_offset = row_pid * kv_hidden_size
-    for _ in tl.range(row_pid, batch_size, row_step):
-        col_indices = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
-        valid_mask = col_indices < kv_hidden_size
-        input_values = tl.load(
-            input_ptr + input_offset + col_indices, mask=valid_mask, other=0.0
-        )
-        tl.store(v_ptr + output_offset + col_indices, input_values, mask=valid_mask)
-
-        input_offset += input_offset_step
-        output_offset += output_offset_step
-
-
-def qk_rmsnorm(
-    input: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    q_hidden_size: int,
-    kv_hidden_size: int,
-    head_dim: int,
-    eps: float,
-    has_gate: bool
-) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    KV_BLOCK_SIZE = triton.next_power_of_2(head_dim)
-    assert KV_BLOCK_SIZE == head_dim
-    assert q_hidden_size % kv_hidden_size == 0
-    Q_GATE_BLOCK_SIZE = q_hidden_size // kv_hidden_size * head_dim
-    batch_size = input.shape[0]
-    total_hidden_size = q_hidden_size * (1 + has_gate) + kv_hidden_size * 2
-    q_output = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
-    k_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
-    v_output = torch.empty(batch_size, kv_hidden_size, device=input.device, dtype=input.dtype)
-    n_cols = kv_hidden_size // KV_BLOCK_SIZE
-    assert num_core % n_cols == 0
-    n_rows = num_core // n_cols
-
-    if has_gate:
-        gate_output = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
-        qk_rmsnorm_gate_triton_kernel[(n_rows, n_cols)](
-            input, q_output, gate_output, k_output, v_output, 
-            q_weight, k_weight, batch_size, q_hidden_size, kv_hidden_size,
-            total_hidden_size, eps, Q_GATE_BLOCK_SIZE, KV_BLOCK_SIZE, head_dim,
-        )
-        return q_output, gate_output, k_output, v_output
-    else:
-        qk_rmsnorm_triton_kernel[(n_rows, n_cols)](
-            input, q_output, k_output, v_output,
-            q_weight, k_weight, batch_size, q_hidden_size, kv_hidden_size,
-            total_hidden_size, eps, Q_GATE_BLOCK_SIZE, KV_BLOCK_SIZE, head_dim,
-        )
-        return q_output, None, k_output, v_output
-
-
-class CustomQwen3NextAttention(Qwen3NextAttention):
-    def __init__(
-        self,
-        config: Qwen3NextConfig,
-        model_config: ModelConfig | None = None,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        nn.Module.__init__(self)
-        self.config = config
-        self.hidden_size = config.hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = config.num_attention_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
-
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
-            self.total_num_kv_heads,
-            bias=getattr(config, "qkv_bias", False),
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
-        )
-
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
-            partial_rotary_factor=config.partial_rotary_factor,
-            dual_chunk_attention_config=self.dual_chunk_attention_config,
-        )
-
-        self.attn = Attention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            **{
-                "layer_idx": extract_layer_index(prefix),
-                "dual_chunk_attention_config": self.dual_chunk_attention_config,
-            }
-            if self.dual_chunk_attention_config
-            else {},
-        )
-
-        self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        output: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ):
-        qkv, _ = self.qkv_proj(hidden_states)
-
-        # if self.attn_output_gate:
-        #     q_gate, k, v = qkv.split(
-        #         [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-        #     )
-        #     orig_shape = q_gate.shape[:-1]
-        #     q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
-        #     q, gate = torch.chunk(q_gate, 2, dim=-1)
-        #     q = q.reshape(*orig_shape, -1)
-        #     gate = gate.reshape(*orig_shape, -1)
-        # else:
-        #     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        # q = self.q_norm(q.view(-1, self.num_heads, self.head_dim)).view(
-        #     -1, self.num_heads * self.head_dim
-        # )
-        # k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
-        #     -1, self.num_kv_heads * self.head_dim
-        # )
-
-        q, gate, k, v = qk_rmsnorm(
-            input=qkv,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            q_hidden_size=self.q_size,
-            kv_hidden_size=self.kv_size,
-            head_dim=self.head_dim,
-            eps=self.q_norm.variance_epsilon,
-            has_gate=self.attn_output_gate
-        )
-
-        q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
-
-        if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
-
-        output[:], _ = self.o_proj(attn_output)
-
-
 class CustomQwen3NextDecoderLayer(Qwen3NextDecoderLayer):
 
     def __init__(
@@ -1089,7 +729,7 @@ class CustomQwen3NextDecoderLayer(Qwen3NextDecoderLayer):
                 speculative_config=speculative_config,
                 prefix=f'{prefix}.linear_attn')
         elif self.layer_type == "full_attention":
-            self.self_attn = CustomQwen3NextAttention(
+            self.self_attn = Qwen3NextAttention(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,
