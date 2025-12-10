@@ -45,7 +45,7 @@ def causal_conv1d_fn_native(
     if initial_states is None:
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)
     else:
-        x = torch.cat([initial_states, x], dim=-1)
+        x = torch.cat([initial_states.squeeze(0), x], dim=-1)
         out = F.conv1d(x, weight.unsqueeze(1), bias, padding=0, groups=dim)
     out = out[..., :seqlen]
     if return_final_states:
