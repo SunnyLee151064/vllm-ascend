@@ -445,6 +445,33 @@ std::tuple<at::Tensor, at::Tensor> npu_gemma_rms_norm_meta(
     return std::tuple<at::Tensor, at::Tensor>(y, rstd);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_gemma_rms_norm_meta(
+    const at::Tensor& x,
+    const at::Tensor& gamma,
+    double epsilon)
+{
+    int64_t dim_x = x.dim();
+    int64_t dim_gamma = gamma.dim();
+    int64_t diff = dim_x - dim_gamma;
+    c10::SymDimVector new_shape;
+    at::Tensor rstd;
+    if (diff > 0) {
+        new_shape.reserve(dim_x);
+        auto x_sizes = x.sym_sizes();
+        for (int64_t i = 0; i < diff; ++i) {
+            new_shape.push_back(x_sizes[i]);
+        }
+        for (int64_t i = 0; i < dim_gamma; ++i) {
+            new_shape.push_back(c10::SymInt(1));
+        }
+    } else {
+        new_shape.assign(dim_x, c10::SymInt(1));
+    }
+    rstd = at::empty_symint(new_shape, x.options().dtype(at::kFloat));
+    at::Tensor y = at::empty_symint(x.sym_sizes(), x.options());
+    return std::tuple<at::Tensor, at::Tensor>(y, rstd);
+}
+
 void transpose_kv_cache_by_block_meta(
     const at::TensorList &k_cache,
     const at::TensorList &v_cache,
@@ -457,7 +484,6 @@ void transpose_kv_cache_by_block_meta(
 {
     return;
 }
-
 at::Tensor npu_causal_conv1d_update_meta(
     const at::Tensor& x,
     const at::Tensor& weight,
