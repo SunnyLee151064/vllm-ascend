@@ -137,7 +137,7 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
 {
     auto xShapePtr = context->GetInputShape(X_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, xShapePtr);
-    auto xShape = EnsureNotScalar(xShapePtr->GetStorageShape());
+    auto xShape = EnsureNotScalar_FN(xShapePtr->GetStorageShape());
 
     int64_t dim = 0;
     int64_t cuSeqlen = 0;
@@ -169,7 +169,7 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
 
     auto wShapePtr = context->GetInputShape(WEIGHT_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, wShapePtr);
-    auto wShape = EnsureNotScalar(wShapePtr->GetStorageShape());
+    auto wShape = EnsureNotScalar_FN(wShapePtr->GetStorageShape());
     if(wShape.GetDimNum() != 2){
         return ge::GRAPH_FAILED;
     } 
@@ -184,7 +184,7 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
 
     auto sShapePtr = context->GetInputShape(CONV_STATES_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, sShapePtr);
-    auto sShape = EnsureNotScalar(sShapePtr->GetStorageShape());
+    auto sShape = EnsureNotScalar_FN(sShapePtr->GetStorageShape());
     if(sShape.GetDimNum() != 3){
        return ge::GRAPH_FAILED;
     }
@@ -200,7 +200,7 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
 
     auto qslShapePtr = context->GetInputShape(QUERY_START_LOC_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, qslShapePtr);
-    auto qslShape = EnsureNotScalar(qslShapePtr->GetStorageShape());
+    auto qslShape = EnsureNotScalar_FN(qslShapePtr->GetStorageShape());
     if(qslShape.GetDimNum() != 1){
         return ge::GRAPH_FAILED;}
     const int64_t qslSize = qslShape.GetDim(0);
@@ -219,13 +219,13 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
 
     auto ciShapePtr = context->GetInputShape(CACHE_INDICES_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, ciShapePtr);
-    auto ciShape = EnsureNotScalar(ciShapePtr->GetStorageShape());
+    auto ciShape = EnsureNotScalar_FN(ciShapePtr->GetStorageShape());
     if(ciShape.GetDimNum() != 1){return ge::GRAPH_FAILED;}
     if(ciShape.GetDim(0) != batch){return ge::GRAPH_FAILED;}
     
     auto hisShapePtr = context->GetInputShape(HAS_INITIAL_STATE_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, hisShapePtr);
-    auto hisShape = EnsureNotScalar(hisShapePtr->GetStorageShape());
+    auto hisShape = EnsureNotScalar_FN(hisShapePtr->GetStorageShape());
     if(hisShape.GetDimNum() != 1){
         return ge::GRAPH_FAILED;}
     if(hisShape.GetDim(0) != batch){
@@ -234,7 +234,7 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
     tiling.set_hasBias(0);
     auto biasShapePtr = context->GetOptionalInputShape(BIAS_INDEX);
     if (biasShapePtr != nullptr && biasShapePtr->GetStorageShape().GetDimNum() != 0) {
-        auto biasShape = EnsureNotScalar(biasShapePtr->GetStorageShape());
+        auto biasShape = EnsureNotScalar_FN(biasShapePtr->GetStorageShape());
         if(biasShape.GetDimNum() != 1){
             return ge::GRAPH_FAILED;}
         if(biasShape.GetDim(0) != dim){

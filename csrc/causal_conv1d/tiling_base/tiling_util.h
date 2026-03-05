@@ -24,7 +24,7 @@ bool IsRegbaseSocVersion(const gert::TilingParseContext* context);
 
 bool IsRegbaseSocVersion(const gert::TilingContext* context);
 
-const gert::Shape& EnsureNotScalar(const gert::Shape& inShape);
+const gert::Shape& EnsureNotScalar_FN(const gert::Shape& inShape);
 } // namespace OpTiling
 } // namespace Transformer
 } // namespace Ops
