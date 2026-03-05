@@ -226,7 +226,7 @@ ge::graphStatus CausalConv1dUpdate::GetOpParam() {
     if (indicesShapePtr != nullptr && indicesShapePtr->GetStorageShape().GetDimNum() != 0) {
         stateIndicesShape_ = EnsureNotScalar(indicesShapePtr->GetStorageShape());
         OP_CHECK_IF(stateIndicesShape_.GetDimNum() != 1, OP_LOGE(context_, "conv_state_indices must be 1D"), return ge::GRAPH_FAILED);
-        OP_CHECK_IF(stateIndicesShape_.GetDim(0) != batch_, OP_LOGE(context_, "conv_state_indices.size must equal batch"), return ge::GRAPH_FAILED);
+        // OP_CHECK_IF(stateIndicesShape_.GetDim(0) != batch_, OP_LOGE(context_, "conv_state_indices.size must equal batch"), return ge::GRAPH_FAILED);
         hasIndices_ = 1;
     }
     
