@@ -1874,10 +1874,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _split_pcp_input(self, req_scheduled_tokens, input_ids, target_hidden_states):
         """
         Split prefill input_ids and target_hidden_states in pcp group.
+
+        Standard PCP (DualChunkSwap):
         1. input_ids padding: [t0, t1, t2, t3, t4, t5] -> [t0, t1, t2, t3, t4, t5, pad, pad]
         2. split input_ids: pcp0 [t0, t1, pad, pad], pcp1 [t2, t3, t4, t5]
         3. split target_hidden_states (already include pcp padding):
         [h0, h1, h2, h3, h4, h5, pad, pad] -> pcp0 [h0, h1, pad, pad], pcp1 [h2, h3, h4, h5]
+
+        Hybrid Attention PCP (linear split, no padding):
+        1. No padding: each rank takes a contiguous slice of the original tokens
+        2. Linear split: rank r gets base + (1 if r < remainder else 0) tokens
+        3. target_hidden_states are in original (unpadded) order, sliced linearly
+
         4. also update max_query_len, seq_lens, cu_num_tokens according to pcp split.
         """
         if len(req_scheduled_tokens) == 0:
@@ -1889,6 +1897,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 0,
                 torch.zeros([0]),
                 torch.tensor([0], dtype=torch.int32),
+            )
+
+        if self.runner.pcp_manager.pcp_use_hybrid_attn:
+            return self._split_pcp_input_hybrid_attn(
+                req_scheduled_tokens, input_ids, target_hidden_states
             )
 
         def _pcp_pad_and_split(num_tokens):
@@ -1925,6 +1938,41 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             pcp_split_input_ids_list.append(pcp_split_input_ids)
             pcp_split_hidden_states_list.append(pcp_split_hidden_states)
             pad_start_index += num_pcp_padded_scheduled_tokens
+        num_tokens = sum(num_pcp_scheduled_tokens)
+        input_ids = torch.cat(pcp_split_input_ids_list)
+        target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
+        max_query_len = max(num_pcp_scheduled_tokens)
+        seq_lens = torch.tensor(num_pcp_scheduled_tokens, dtype=torch.int32)
+        cu_num_tokens = torch.tensor(np.insert(np.cumsum(np.array(num_pcp_scheduled_tokens)), 0, 0))
+        return num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens
+
+    def _split_pcp_input_hybrid_attn(
+        self, req_scheduled_tokens, input_ids, target_hidden_states
+    ):
+        """
+        Linear-split prefill input_ids and target_hidden_states for hybrid attn PCP.
+
+        Unlike DualChunkSwap, hybrid attention models use a simple contiguous split:
+        each rank takes a contiguous slice of each request's tokens, with no padding.
+        This matches the main model's _get_cp_local_seq_lens distribution.
+        """
+        num_pcp_scheduled_tokens = []
+        ori_start_index = 0
+        pcp_split_input_ids_list = []
+        pcp_split_hidden_states_list = []
+        for ori_num_tokens in req_scheduled_tokens.values():
+            base = ori_num_tokens // self.pcp_size
+            remainder = ori_num_tokens % self.pcp_size
+            pcp_tokens = base + (1 if self.pcp_rank < remainder else 0)
+            rank_start = self.pcp_rank * base + min(self.pcp_rank, remainder)
+            num_pcp_scheduled_tokens.append(pcp_tokens)
+            pcp_split_input_ids_list.append(
+                input_ids[ori_start_index + rank_start : ori_start_index + rank_start + pcp_tokens]
+            )
+            pcp_split_hidden_states_list.append(
+                target_hidden_states[ori_start_index + rank_start : ori_start_index + rank_start + pcp_tokens]
+            )
+            ori_start_index += ori_num_tokens
         num_tokens = sum(num_pcp_scheduled_tokens)
         input_ids = torch.cat(pcp_split_input_ids_list)
         target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
