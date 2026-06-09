@@ -1955,9 +1955,17 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         Unlike DualChunkSwap, hybrid attention models use a simple contiguous split:
         each rank takes a contiguous slice of each request's tokens, with no padding.
         This matches the main model's _get_cp_local_seq_lens distribution.
+
+        NOTE: input_ids and target_hidden_states have different layouts:
+        - input_ids: already in per-rank PCP-split order (each request contributes
+          pcp_tokens entries, sequentially)
+        - target_hidden_states: in original (unsplit) order (each request
+          contributes ori_num_tokens entries)
+        We track separate offsets for each.
         """
         num_pcp_scheduled_tokens = []
-        ori_start_index = 0
+        input_offset = 0
+        hidden_offset = 0
         pcp_split_input_ids_list = []
         pcp_split_hidden_states_list = []
         for ori_num_tokens in req_scheduled_tokens.values():
@@ -1967,12 +1975,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             rank_start = self.pcp_rank * base + min(self.pcp_rank, remainder)
             num_pcp_scheduled_tokens.append(pcp_tokens)
             pcp_split_input_ids_list.append(
-                input_ids[ori_start_index + rank_start : ori_start_index + rank_start + pcp_tokens]
+                input_ids[input_offset : input_offset + pcp_tokens]
             )
             pcp_split_hidden_states_list.append(
-                target_hidden_states[ori_start_index + rank_start : ori_start_index + rank_start + pcp_tokens]
+                target_hidden_states[hidden_offset + rank_start : hidden_offset + rank_start + pcp_tokens]
             )
-            ori_start_index += ori_num_tokens
+            input_offset += pcp_tokens
+            hidden_offset += ori_num_tokens
         num_tokens = sum(num_pcp_scheduled_tokens)
         input_ids = torch.cat(pcp_split_input_ids_list)
         target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
