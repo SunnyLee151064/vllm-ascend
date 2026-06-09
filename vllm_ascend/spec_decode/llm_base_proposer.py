@@ -1956,16 +1956,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         each rank takes a contiguous slice of each request's tokens, with no padding.
         This matches the main model's _get_cp_local_seq_lens distribution.
 
-        NOTE: input_ids and target_hidden_states have different layouts:
-        - input_ids: already in per-rank PCP-split order (each request contributes
-          pcp_tokens entries, sequentially)
-        - target_hidden_states: in original (unsplit) order (each request
-          contributes ori_num_tokens entries)
-        We track separate offsets for each.
+        Both input_ids and target_hidden_states are in original (global, unsplit)
+        order, so we use the same offset + rank_start indexing for both.
         """
         num_pcp_scheduled_tokens = []
-        input_offset = 0
-        hidden_offset = 0
+        global_offset = 0
         pcp_split_input_ids_list = []
         pcp_split_hidden_states_list = []
         for ori_num_tokens in req_scheduled_tokens.values():
@@ -1974,14 +1969,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             pcp_tokens = base + (1 if self.pcp_rank < remainder else 0)
             rank_start = self.pcp_rank * base + min(self.pcp_rank, remainder)
             num_pcp_scheduled_tokens.append(pcp_tokens)
-            pcp_split_input_ids_list.append(
-                input_ids[input_offset : input_offset + pcp_tokens]
-            )
-            pcp_split_hidden_states_list.append(
-                target_hidden_states[hidden_offset + rank_start : hidden_offset + rank_start + pcp_tokens]
-            )
-            input_offset += pcp_tokens
-            hidden_offset += ori_num_tokens
+            start = global_offset + rank_start
+            end = start + pcp_tokens
+            pcp_split_input_ids_list.append(input_ids[start:end])
+            pcp_split_hidden_states_list.append(target_hidden_states[start:end])
+            global_offset += ori_num_tokens
         num_tokens = sum(num_pcp_scheduled_tokens)
         input_ids = torch.cat(pcp_split_input_ids_list)
         target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
