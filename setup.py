@@ -441,3 +441,14 @@ setup(
         seq_lens = torch.tensor(num_pcp_scheduled_tokens, dtype=torch.int32)
         cu_num_tokens = torch.tensor(np.insert(np.cumsum(np.array(num_pcp_scheduled_tokens)), 0, 0))
         return num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens
+
+
+if self.decode_threshold == 1:
+            actual_seq_lengths_q = (torch.arange(num_decodes) + 1).tolist() + query_start_loc_cpu[1:].tolist()[
+                num_decodes:
+            ]
+        else:
+            actual_seq_lengths_q = (
+                query_start_loc_cpu[1 : num_decodes + 1].tolist()
+                + query_start_loc_cpu[num_decodes + 1 :].tolist()
+            )
