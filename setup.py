@@ -1,7 +1,3 @@
-#
-# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-# Copyright 2023 The vLLM team.
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -14,441 +10,531 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-# Adapted from https://github.com/vllm-project/vllm/blob/main/setup.py
-#
 
-import importlib.util
-import logging
-import os
-import subprocess
-import sys
-from sysconfig import get_paths
-from typing import Dict, List
+import math
+from unittest.mock import MagicMock
 
-from setuptools import Extension, find_packages, setup
-from setuptools.command.build_ext import build_ext
-from setuptools.command.build_py import build_py
-from setuptools.command.develop import develop
-from setuptools.command.install import install
-from setuptools_scm import get_version
+import numpy as np
+import pytest
+import torch
+
+from vllm_ascend.worker.pcp_utils import PCPManager
 
 
-def load_module_from_path(module_name, path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-ROOT_DIR = os.path.dirname(__file__)
-logger = logging.getLogger(__name__)
-
-
-def check_or_set_default_env(cmake_args,
-                             env_name,
-                             env_variable,
-                             default_path=""):
-    if env_variable is None:
-        logging.warning(
-            f"No {env_name} found in your environment, pleause try to set {env_name} "
-            "if you customize the installation path of this library, otherwise default "
-            "path will be adapted during build this project")
-        logging.warning(f"Set default {env_name}: {default_path}")
-        env_variable = default_path
-    else:
-        logging.info(f"Found existing {env_name}: {env_variable}")
-    # cann package seems will check this environments in cmake, need write this env variable back.
-    if env_name == "ASCEND_HOME_PATH":
-        os.environ["ASCEND_HOME_PATH"] = env_variable
-    cmake_args += [f"-D{env_name}={env_variable}"]
-    return cmake_args
-
-
-envs = load_module_from_path("envs",
-                             os.path.join(ROOT_DIR, "vllm_ascend", "envs.py"))
-
-
-class CMakeExtension(Extension):
-
-    def __init__(self,
-                 name: str,
-                 cmake_lists_dir: str = ".",
-                 **kwargs) -> None:
-        super().__init__(name, sources=[], py_limited_api=False, **kwargs)
-        self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
-
-
-class custom_build_info(build_py):
-
-    def run(self):
-        soc_version = envs.SOC_VERSION
-        if not soc_version:
-            raise ValueError(
-                "SOC version is not set. Please set SOC_VERSION environment variable."
-            )
-        if "310" in soc_version and not envs.COMPILE_CUSTOM_KERNELS:
-            raise ValueError(
-                "SOC version 310 only supports custom kernels. Please set COMPILE_CUSTOM_KERNELS=1 to enable custom kernels."
-            )
-
-        package_dir = os.path.join(ROOT_DIR, "vllm_ascend", "_build_info.py")
-        with open(package_dir, "w+") as f:
-            f.write('# Auto-generated file\n')
-            f.write(f"__soc_version__ = '{soc_version}'\n")
-            f.write(
-                f"__sleep_mode_enabled__ = {envs.COMPILE_CUSTOM_KERNELS}\n")
-        logging.info(
-            f"Generated _build_info.py with SOC version: {soc_version}")
-        super().run()
-
-
-class cmake_build_ext(build_ext):
-    # A dict of extension directories that have been configured.
-    did_config: Dict[str, bool] = {}
-
-    #
-    # Determine number of compilation jobs
-    #
-    def compute_num_jobs(self):
-        # `num_jobs` is either the value of the MAX_JOBS environment variable
-        # (if defined) or the number of CPUs available.
-        num_jobs = envs.MAX_JOBS
-        if num_jobs is not None:
-            num_jobs = int(num_jobs)
-            logger.info("Using MAX_JOBS=%d as the number of jobs.", num_jobs)
-        else:
-            try:
-                # os.sched_getaffinity() isn't universally available, so fall
-                #  back to os.cpu_count() if we get an error here.
-                num_jobs = len(os.sched_getaffinity(0))
-            except AttributeError:
-                num_jobs = os.cpu_count()
-        num_jobs = max(1, num_jobs)
-
-        return num_jobs
-
-    #
-    # Perform cmake configuration for a single extension.
-    #
-    def configure(self, ext: CMakeExtension) -> None:
-        build_temp = self.build_temp
-        os.makedirs(build_temp, exist_ok=True)
-        source_dir = os.path.abspath(ROOT_DIR)
-        python_executable = sys.executable
-        cmake_args = ["cmake"]
-        # Default use release mode to compile the csrc code
-        # Turbo now support compiled with Release, Debug and RelWithDebugInfo
-        if envs.CMAKE_BUILD_TYPE is None or envs.CMAKE_BUILD_TYPE not in [
-                "Debug",
-                "Release",
-                "RelWithDebugInfo",
-        ]:
-            envs.CMAKE_BUILD_TYPE = "Release"
-        cmake_args += [f"-DCMAKE_BUILD_TYPE={envs.CMAKE_BUILD_TYPE}"]
-        # Default dump the compile commands for lsp
-        cmake_args += ["-DCMAKE_EXPORT_COMPILE_COMMANDS=1"]
-        if envs.CXX_COMPILER is not None:
-            cmake_args += [f"-DCMAKE_CXX_COMPILER={envs.CXX_COMPILER}"]
-        if envs.C_COMPILER is not None:
-            cmake_args += [f"-DCMAKE_C_COMPILER={envs.C_COMPILER}"]
-        if envs.VERBOSE:
-            cmake_args += ["-DCMAKE_VERBOSE_MAKEFILE=ON"]
-
-        # find ASCEND_HOME_PATH
-        check_or_set_default_env(
-            cmake_args,
-            "ASCEND_HOME_PATH",
-            envs.ASCEND_HOME_PATH,
-            "/usr/local/Ascend/ascend-toolkit/latest",
-        )
-
-        # find PYTHON_EXECUTABLE
-        check_or_set_default_env(cmake_args, "PYTHON_EXECUTABLE",
-                                 sys.executable)
-
-        # find PYTHON_INCLUDE_PATH
-        check_or_set_default_env(cmake_args, "PYTHON_INCLUDE_PATH",
-                                 get_paths()["include"])
-
-        # ccache and ninja can not be applied at ascendc kernels now
-
-        try:
-            # if pybind11 is installed via pip
-            pybind11_cmake_path = (subprocess.check_output(
-                [python_executable, "-m", "pybind11",
-                 "--cmakedir"]).decode().strip())
-        except subprocess.CalledProcessError as e:
-            # else specify pybind11 path installed from source code on CI container
-            raise RuntimeError(f"CMake configuration failed: {e}")
-
-        install_path = os.path.join(ROOT_DIR, self.build_lib)
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            install_path = os.path.join(ROOT_DIR, "vllm_ascend")
-        # add CMAKE_INSTALL_PATH
-        cmake_args += [f"-DCMAKE_INSTALL_PREFIX={install_path}"]
-
-        cmake_args += [f"-DCMAKE_PREFIX_PATH={pybind11_cmake_path}"]
-
-        cmake_args += [f"-DSOC_VERSION={envs.SOC_VERSION}"]
-
-        # Override the base directory for FetchContent downloads to $ROOT/.deps
-        # This allows sharing dependencies between profiles,
-        # and plays more nicely with sccache.
-        # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
-        fc_base_dir = os.path.join(ROOT_DIR, ".deps")
-        fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
-
-        torch_npu_command = "python3 -m pip show torch-npu | grep '^Location:' | awk '{print $2}'"
-        try:
-            torch_npu_path = subprocess.check_output(
-                torch_npu_command, shell=True).decode().strip()
-            torch_npu_path += "/torch_npu"
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Retrieve torch version version failed: {e}")
-
-        # add TORCH_NPU_PATH
-        cmake_args += [f"-DTORCH_NPU_PATH={torch_npu_path}"]
-
-        build_tool = []
-        # TODO(ganyi): ninja and ccache support for ascend c auto codegen. now we can only use make build
-        # if which('ninja') is not None:
-        #     build_tool += ['-G', 'Ninja']
-        # Default build tool to whatever cmake picks.
-
-        cmake_args += [source_dir]
-        logging.info(f"cmake config command: {cmake_args}")
-        try:
-            subprocess.check_call(cmake_args, cwd=self.build_temp)
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"CMake configuration failed: {e}")
-
-        subprocess.check_call(
-            ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
-            cwd=self.build_temp,
-        )
-
-    def build_extensions(self) -> None:
-        if not envs.COMPILE_CUSTOM_KERNELS:
-            return
-        # Ensure that CMake is present and working
-        try:
-            subprocess.check_output(["cmake", "--version"])
-        except OSError as e:
-            raise RuntimeError(f"Cannot find CMake executable: {e}")
-
-        # Create build directory if it does not exist.
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
-
-        targets = []
-
-        os.makedirs(os.path.join(self.build_lib, "vllm_ascend"), exist_ok=True)
-
-        def target_name(s: str) -> str:
-            return s.removeprefix("vllm_ascend.")
-
-        # Build all the extensions
-        for ext in self.extensions:
-            self.configure(ext)
-            targets.append(target_name(ext.name))
-
-        num_jobs = self.compute_num_jobs()
-
-        build_args = [
-            "--build",
-            ".",
-            f"-j={num_jobs}",
-            *[f"--target={name}" for name in targets],
-        ]
-        try:
-            subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
-        except OSError as e:
-            raise RuntimeError(f"Build library failed: {e}")
-        # Install the libraries
-        install_args = [
-            "cmake",
-            "--install",
-            ".",
-        ]
-        try:
-            subprocess.check_call(install_args, cwd=self.build_temp)
-        except OSError as e:
-            raise RuntimeError(f"Install library failed: {e}")
-
-        # copy back to build folder for editable build
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            import shutil
-            for root, _, files in os.walk(self.build_temp):
-                for file in files:
-                    if file.endswith(".so"):
-                        src_path = os.path.join(root, file)
-                        dst_path = os.path.join(self.build_lib, "vllm_ascend",
-                                                file)
-                        shutil.copy(src_path, dst_path)
-                        print(f"Copy: {src_path} -> {dst_path}")
-
-    def run(self):
-        # First, run the standard build_ext command to compile the extensions
-        super().run()
-
-
-class custom_install(install):
-
-    def run(self):
-        self.run_command("build_ext")
-        install.run(self)
-
-
-ROOT_DIR = os.path.dirname(__file__)
-try:
-    VERSION = get_version(write_to="vllm_ascend/_version.py")
-except LookupError:
-    # The checkout action in github action CI does not checkout the tag. It
-    # only checks out the commit. In this case, we set a dummy version.
-    VERSION = "0.0.0"
-
-ext_modules = []
-if envs.COMPILE_CUSTOM_KERNELS:
-    ext_modules = [CMakeExtension(name="vllm_ascend.vllm_ascend_C")]
-
-
-def get_path(*filepath) -> str:
-    return os.path.join(ROOT_DIR, *filepath)
-
-
-def read_readme() -> str:
-    """Read the README file if present."""
-    p = get_path("README.md")
-    if os.path.isfile(p):
-        with open(get_path("README.md"), encoding="utf-8") as f:
-            return f.read()
-    else:
-        return ""
-
-
-def get_requirements() -> List[str]:
-    """Get Python package dependencies from requirements.txt."""
-
-    def _read_requirements(filename: str) -> List[str]:
-        with open(get_path(filename)) as f:
-            requirements = f.read().strip().split("\n")
-        resolved_requirements = []
-        for line in requirements:
-            if line.startswith("-r "):
-                resolved_requirements += _read_requirements(line.split()[1])
-            elif line.startswith("--"):
-                continue
-            else:
-                resolved_requirements.append(line)
-        return resolved_requirements
-
-    try:
-        requirements = _read_requirements("requirements.txt")
-    except ValueError:
-        print("Failed to read requirements.txt in vllm_ascend.")
-    return requirements
-
-
-cmdclass = {
-    "build_py": custom_build_info,
-    "build_ext": cmake_build_ext,
-    "install": custom_install
-}
-
-setup(
-    name="vllm_ascend",
-    # Follow:
-    # https://packaging.python.org/en/latest/specifications/version-specifiers
-    version=VERSION,
-    author="vLLM-Ascend team",
-    license="Apache 2.0",
-    description="vLLM Ascend backend plugin",
-    long_description=read_readme(),
-    long_description_content_type="text/markdown",
-    url="https://github.com/vllm-project/vllm-ascend",
-    project_urls={
-        "Homepage": "https://github.com/vllm-project/vllm-ascend",
-    },
-    # TODO: Add 3.12 back when torch-npu support 3.12
-    classifiers=[
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
-        "License :: OSI Approved :: Apache Software License",
-        "Intended Audience :: Developers",
-        "Intended Audience :: Information Technology",
-        "Intended Audience :: Science/Research",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-        "Topic :: Scientific/Engineering :: Information Analysis",
+@pytest.mark.parametrize(
+    "pcp_size, dcp_size, num_reqs, query_lens, num_decodes, use_mla, total_tokens, expect_not_none",
+    [
+        (1, 1, 5, [10, 20, 30, 40, 50], 2, False, 100, False),
+        (1, 2, 3, [20, 30, 40], 1, False, 50, True),
+        (2, 1, 4, [5, 10, 40, 60], 2, False, 100, True),
+        (2, 1, 4, [5, 10, 40, 60], 2, True, 100, True),
+        (2, 1, 3, [5, 10, 15], 3, False, 50, True),
+        (2, 1, 3, [40, 50, 60], 0, False, 150, True),
     ],
-    packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
-    python_requires=">=3.10",
-    install_requires=get_requirements(),
-    ext_modules=ext_modules,
-    cmdclass=cmdclass,
-    extras_require={},
-    entry_points={
-        "vllm.platform_plugins": ["ascend = vllm_ascend:register"],
-        "vllm.general_plugins": [
-            "ascend_enhanced_model = vllm_ascend:register_model",
-            "ascend_kv_connector = vllm_ascend:register_connector",
-            "ascend_model_loader = vllm_ascend:register_model_loader",
-            "ascend_service_profiling = vllm_ascend:register_service_profiling"
-        ],
-    },
 )
+def test_generate_pcp_metadata_basic(
+    pcp_size, dcp_size, num_reqs, query_lens, num_decodes, use_mla, total_tokens, expect_not_none
+):
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.model_config.use_mla = use_mla
+    vllm_config.parallel_config.cp_kv_cache_interleave_size = 64
+    vllm_config.speculative_config.num_speculative_tokens = 0
 
-    def _split_pcp_input_hybrid_attn(
-        self, req_scheduled_tokens, input_ids, target_hidden_states
-    ):
-        """
-        Linear-split prefill input_ids and target_hidden_states for hybrid attn PCP.
+    pcp_manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=0,
+        dcp_world_size=dcp_size,
+        dcp_rank=0,
+        max_buffer_num_tokens=10000,
+        max_num_reqs=1000,
+        device="cpu",
+        vllm_config=vllm_config,
+        use_async_scheduling=False,
+        pin_memory=False,
+    )
+    input_batch = MagicMock()
+    input_batch.num_reqs = num_reqs
 
-        Uses the same alignment as DualChunkSwap (pad to 2*pcp_size multiple)
-        so each rank gets an equal number of tokens, but splits linearly
-        (contiguous slices) instead of interleaved head/tail chunks.
+    num_computed_tokens = []
+    num_prompt_tokens = []
+    num_tokens = []
 
-        Example: ori_num_tokens=7, pcp_size=2 → padded=8, pcp_tokens=4
-          rank 0: [0,1,2,3]  (4 valid)
-          rank 1: [4,5,6,7]  (3 valid + 1 pad at position 7)
-        """
-        num_pcp_scheduled_tokens = []
-        global_offset = 0
-        pcp_split_input_ids_list = []
-        pcp_split_hidden_states_list = []
-        for ori_num_tokens in req_scheduled_tokens.values():
-            padded_tokens = cdiv(ori_num_tokens, 2 * self.pcp_size) * 2 * self.pcp_size
-            pcp_tokens = padded_tokens // self.pcp_size
-            num_pads = padded_tokens - ori_num_tokens
-            rank_start = self.pcp_rank * pcp_tokens
-            num_pcp_scheduled_tokens.append(pcp_tokens)
-            # Pad and slice input_ids
-            req_input_ids = input_ids[global_offset : global_offset + ori_num_tokens]
-            if num_pads > 0:
-                req_input_ids = F.pad(req_input_ids, (0, num_pads))
-            pcp_split_input_ids_list.append(req_input_ids[rank_start : rank_start + pcp_tokens])
-            # Pad and slice target_hidden_states
-            req_hidden = target_hidden_states[global_offset : global_offset + ori_num_tokens]
-            if num_pads > 0:
-                req_hidden = F.pad(req_hidden, (0, 0, 0, num_pads))
-            pcp_split_hidden_states_list.append(req_hidden[rank_start : rank_start + pcp_tokens])
-            global_offset += ori_num_tokens
-        num_tokens = sum(num_pcp_scheduled_tokens)
-        input_ids = torch.cat(pcp_split_input_ids_list)
-        target_hidden_states = torch.cat(pcp_split_hidden_states_list, dim=0)
-        max_query_len = max(num_pcp_scheduled_tokens)
-        seq_lens = torch.tensor(num_pcp_scheduled_tokens, dtype=torch.int32)
-        cu_num_tokens = torch.tensor(np.insert(np.cumsum(np.array(num_pcp_scheduled_tokens)), 0, 0))
-        return num_tokens, input_ids, target_hidden_states, max_query_len, seq_lens, cu_num_tokens
-
-
-if self.decode_threshold == 1:
-            actual_seq_lengths_q = (torch.arange(num_decodes) + 1).tolist() + query_start_loc_cpu[1:].tolist()[
-                num_decodes:
-            ]
+    for i in range(num_reqs):
+        if i < num_decodes:
+            num_computed_tokens.append(query_lens[i])
+            num_prompt_tokens.append(query_lens[i] // 2)
+            num_tokens.append(query_lens[i])
         else:
-            actual_seq_lengths_q = (
-                query_start_loc_cpu[1 : num_decodes + 1].tolist()
-                + query_start_loc_cpu[num_decodes + 1 :].tolist()
-            )
+            num_computed_tokens.append(0)
+            num_prompt_tokens.append(query_lens[i])
+            num_tokens.append(query_lens[i])
+
+    input_batch.num_computed_tokens_cpu = np.array(num_computed_tokens)
+    input_batch.num_prompt_tokens = torch.tensor(num_prompt_tokens)
+    input_batch.num_tokens = torch.tensor(num_tokens)
+    num_scheduled_tokens = np.array(query_lens) - input_batch.num_computed_tokens_cpu
+
+    query_lens = torch.tensor(query_lens)
+    result, _ = pcp_manager.generate_pcp_metadata(
+        total_tokens,
+        query_lens,
+        input_batch,
+        num_scheduled_tokens,
+        torch.tensor([]),
+        num_reqs_padded=num_reqs,
+        num_reqs=num_reqs,
+    )
+
+    if not expect_not_none:
+        assert result is None, f"Expected to return None, but got {type(result)}"
+    else:
+        assert result is not None, "Expected to return a metadata object, but got None."
+
+        assert hasattr(result, "num_actual_tokens_pcp_padded")
+        assert hasattr(result, "num_computed_tokens_of_pcp_dcp")
+
+        if pcp_size > 1:
+            assert hasattr(result, "pcp_allgather_restore_idx")
+
+            has_prefill_requests = (num_reqs - num_decodes) > 0
+            if has_prefill_requests:
+                assert hasattr(result, "q_head_idx_tensor")
+                assert hasattr(result, "q_tail_idx_tensor")
+                assert hasattr(result, "q_full_idx")
+                assert hasattr(result, "kv_with_q_head_nomask_idx_tensor")
+                assert hasattr(result, "kv_with_q_head_mask_idx_tensor")
+                assert hasattr(result, "kv_with_q_tail_nomask_idx_tensor")
+                assert hasattr(result, "kv_with_q_tail_mask_idx_tensor")
+                assert hasattr(result, "kv_tail_proj_idx_tensor")
+                assert hasattr(result, "kv_with_q_head_attn_idx_in_tail_tensor")
+                assert hasattr(result, "kv_with_q_tail_attn_idx_in_tail_tensor")
+                assert hasattr(result, "attn_mask_seqlens")
+                assert hasattr(result, "head_attn_nomask_seqlens")
+                assert hasattr(result, "tail_attn_nomask_seqlens")
+                assert hasattr(result, "head_actual_seq_lengths_kv")
+                assert hasattr(result, "tail_actual_seq_lengths_kv")
+
+
+@pytest.mark.parametrize(
+    "pcp_size, pcp_rank, query_lens",
+    [
+        (2, 0, [8]),
+        (2, 1, [8]),
+        (4, 0, [8, 12]),
+        (4, 3, [8, 12]),
+    ],
+)
+def test_generate_pcp_metadata_mla_tail_projection_indices(pcp_size, pcp_rank, query_lens):
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.model_config.use_mla = True
+    vllm_config.model_config.hf_config.model_type = "deepseek_v2"
+    vllm_config.parallel_config.cp_kv_cache_interleave_size = 64
+    vllm_config.scheduler_config.max_num_batched_tokens = 10000
+    vllm_config.scheduler_config.max_num_seqs = 1000
+    vllm_config.speculative_config.num_speculative_tokens = 0
+
+    pcp_manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=pcp_rank,
+        dcp_world_size=1,
+        dcp_rank=0,
+        max_buffer_num_tokens=10000,
+        max_num_reqs=1000,
+        device="cpu",
+        vllm_config=vllm_config,
+        use_async_scheduling=False,
+        pin_memory=False,
+    )
+
+    num_reqs = len(query_lens)
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+    pcp_manager.init_batch_info(num_scheduled_tokens, num_reqs)
+
+    input_batch = MagicMock()
+    input_batch.num_reqs = num_reqs
+    input_batch.num_computed_tokens_cpu = np.zeros(num_reqs, dtype=np.int32)
+    input_batch.num_prompt_tokens = torch.tensor(query_lens)
+    input_batch.num_tokens = torch.tensor(query_lens)
+
+    result, _ = pcp_manager.generate_pcp_metadata(
+        int(num_scheduled_tokens.sum()),
+        torch.tensor(query_lens, dtype=torch.int32),
+        input_batch,
+        num_scheduled_tokens,
+        torch.zeros((num_reqs, 1), dtype=torch.int32),
+        num_reqs_padded=num_reqs,
+        num_reqs=num_reqs,
+    )
+
+    assert result is not None
+    tail_idx = result.kv_tail_proj_idx_tensor
+    full_kv_len = int(num_scheduled_tokens.sum()) * pcp_size
+    assert tail_idx.numel() <= full_kv_len
+    assert tail_idx.numel() > 0
+    assert tail_idx.min().item() >= 0
+    assert tail_idx.max().item() < full_kv_len
+
+    expected_tail_idx: list[int] = []
+    expected_head_attn_idx_in_tail = []
+    expected_tail_attn_idx_in_tail = []
+    expected_head_actual_seq_lengths_kv = []
+    expected_tail_actual_seq_lengths_kv = []
+    kv_req_offset = 0
+    q_head_chunk_id = pcp_rank
+    q_tail_chunk_id = pcp_size * 2 - 1 - pcp_rank
+    for seq_len in query_lens:
+        chunk_len = seq_len // 2
+        tail_proj_offset = len(expected_tail_idx)
+        tail_proj_len = chunk_len * (q_tail_chunk_id + 1)
+        expected_tail_idx.extend(list(range(kv_req_offset, kv_req_offset + tail_proj_len)))
+        expected_head_attn_idx_in_tail.extend(
+            list(range(tail_proj_offset, tail_proj_offset + chunk_len * (q_head_chunk_id + 1)))
+        )
+        expected_tail_attn_idx_in_tail.extend(list(range(tail_proj_offset, tail_proj_offset + tail_proj_len)))
+        expected_head_actual_seq_lengths_kv.append(len(expected_head_attn_idx_in_tail))
+        expected_tail_actual_seq_lengths_kv.append(len(expected_tail_attn_idx_in_tail))
+        kv_req_offset += seq_len * pcp_size
+
+    assert torch.equal(tail_idx.cpu(), torch.tensor(expected_tail_idx, dtype=tail_idx.dtype))
+    head_attn_idx = result.kv_with_q_head_attn_idx_in_tail_tensor
+    tail_attn_idx = result.kv_with_q_tail_attn_idx_in_tail_tensor
+    assert torch.equal(
+        head_attn_idx.cpu(),
+        torch.tensor(expected_head_attn_idx_in_tail, dtype=head_attn_idx.dtype),
+    )
+    assert torch.equal(
+        tail_attn_idx.cpu(),
+        torch.tensor(expected_tail_attn_idx_in_tail, dtype=tail_attn_idx.dtype),
+    )
+    assert result.head_actual_seq_lengths_kv == expected_head_actual_seq_lengths_kv
+    assert result.tail_actual_seq_lengths_kv == expected_tail_actual_seq_lengths_kv
+
+
+@pytest.mark.parametrize(
+    "tokens, num_reqs, num_computed_tokens, num_prompt_tokens, pcp_size, pcp_rank, expected_pcp_tokens",
+    [
+        # Case 1: prefill only
+        ([8, 12, 16], 3, [0, 0, 0], [8, 12, 16], 4, 0, [2, 4, 4]),
+        # # Case 2: mix prefill and decode
+        ([8, 4, 12], 3, [8, 4, 0], [8, 0, 12], 4, 0, [2, 2, 4]),
+        # # Case 3: request which need to be padded
+        ([3, 7, 9], 3, [0, 0, 0], [3, 7, 9], 4, 0, [2, 2, 4]),
+        # Case 4: single request
+        ([10], 1, [0], [10], 4, 0, [4]),
+    ],
+)
+def test_update_tokens_for_pcp_basic(
+    tokens, num_reqs, num_computed_tokens, num_prompt_tokens, pcp_size, pcp_rank, expected_pcp_tokens
+):
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = 0
+    vllm_config.scheduler_config.max_num_seqs = 1000
+
+    pcp_manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=0,
+        dcp_world_size=1,
+        dcp_rank=0,
+        max_buffer_num_tokens=10000,
+        max_num_reqs=1000,
+        device="cpu",
+        vllm_config=vllm_config,
+        use_async_scheduling=False,
+        pin_memory=False,
+    )
+    input_batch = MagicMock()
+    input_batch.num_reqs = num_reqs
+    input_batch.num_computed_tokens_cpu = np.array(num_computed_tokens, dtype=np.int32)
+    input_batch.num_prompt_tokens = np.array(num_prompt_tokens, dtype=np.int32)
+    arange_np = np.arange(10000)
+    num_scheduled_tokens = np.array(tokens)
+    pcp_manager.init_batch_info(num_scheduled_tokens, num_reqs)
+    pcp_tokens_result, positions_result = pcp_manager.update_tokens_for_pcp(num_scheduled_tokens, arange_np)
+
+    assert np.array_equal(pcp_tokens_result, expected_pcp_tokens), (
+        f"Expected pcp_tokens: {expected_pcp_tokens}, got: {pcp_tokens_result}"
+    )
+
+    total_pcp_tokens: int = np.sum(pcp_tokens_result)
+    assert positions_result.shape == (total_pcp_tokens,), (
+        f"Positions shape mismatch. Expected length {total_pcp_tokens}, got {positions_result.shape}"
+    )
+
+
+# yapf: disable
+@pytest.mark.parametrize(
+    "seq_lens, pcp_world_size, dcp_world_size, cp_kv_cache_interleave_size, target",
+    [
+        # without pcp and dcp
+        (torch.tensor([1, 2, 128, 129]), 1, 1, 1,
+        torch.tensor([[[1]], [[2]], [[128]], [[129]]])),
+        # pcp
+        (torch.tensor([1, 2, 128, 129]), 2, 1, 1,
+        torch.tensor([[[1], [0]], [[1], [1]], [[64], [64]], [[65], [64]]])),
+        # dcp
+        (torch.tensor([1, 2, 128, 129]), 1, 2, 1,
+        torch.tensor([[[1, 0]], [[1, 1]], [[64, 64]], [[65, 64]]])),
+        # pcp + dcp
+        (torch.tensor([1, 2, 128, 129]), 2, 2, 1,
+        torch.tensor([[[1, 0], [0, 0]], [[1, 1], [0, 0]],
+                     [[32, 32], [32, 32]], [[33, 32], [32, 32]]])),
+        # specify interleave_size
+        (torch.tensor([1, 2, 128, 129]), 2, 1, 2,
+        torch.tensor([[[1], [0]], [[2], [0]], [[64], [64]], [[65], [64]]])),
+        (torch.tensor([1, 2, 128, 129]), 2, 1, 128,
+        torch.tensor([[[1], [0]], [[2], [0]], [[128], [0]], [[128], [1]]])),
+        (torch.tensor([1, 2, 128, 129, 256, 257]), 2, 2, 128,
+        torch.tensor([[[1, 0], [0, 0]], [[2, 0], [0, 0]],
+                     [[128, 0], [0, 0]], [[128, 1], [0, 0]],
+                     [[128, 128], [0, 0]], [[128, 128], [1, 0]]])),
+    ]
+)
+# yapf: enable
+def test_get_cp_local_seq_lens(
+    seq_lens,
+    pcp_world_size,
+    dcp_world_size,
+    cp_kv_cache_interleave_size,
+    target,
+):
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = 0
+    pcp_manager = PCPManager(pcp_world_size=pcp_world_size,
+                             pcp_rank=0,
+                             dcp_world_size=dcp_world_size,
+                             dcp_rank=0,
+                             max_buffer_num_tokens=10000,
+                             max_num_reqs=1000,
+                             device="cpu",
+                             vllm_config=vllm_config,
+                             use_async_scheduling=False,
+                             pin_memory=False)
+    ret = pcp_manager._get_cp_local_seq_lens(seq_lens, pcp_world_size,
+                                             dcp_world_size,
+                                             cp_kv_cache_interleave_size)
+    assert torch.equal(ret, target)
+
+
+# yapf: disable
+@pytest.mark.parametrize(
+    "req_ids, num_computed_tokens," \
+    "token_ids_tensor_list," \
+    "num_reqs, total_num_scheduled_tokens, num_scheduled_tokens," \
+    "target_input_ids_pcp_full, target_query_start_loc_pcp_full",
+    [
+        # prefill
+        (
+            ['0'], np.array([0]),
+            [torch.tensor([0, 671, 6102, 294, 8760, 344])],
+            1, 6, {'0': 6},
+            torch.tensor([0, 671, 6102, 294, 8760, 344]),
+            torch.tensor([0, 6])
+        ),
+        # decode
+        (
+            ['0'], np.array([6]),
+            [torch.tensor([0, 671, 6102, 294, 8760, 344, 88907, 0])],
+            1, 2, {'0': 2},
+            torch.tensor([88907, 0]),
+            torch.tensor([0, 2])
+        ),
+        # decode + prefill
+        (
+            ['0', '1'], np.array([6, 0]),
+            [
+                torch.tensor([0, 671, 6102, 294, 8760, 344, 88907, 0]),
+                torch.tensor([0, 19923, 14, 1026, 2329, 344, 9807, 14, 342, 1030]),
+            ],
+            2, 12, {'0': 2, '1': 10},
+            torch.tensor([88907, 0, 0, 19923, 14, 1026, 2329, 344, 9807, 14, 342, 1030]),
+            torch.tensor([0, 2, 12])
+        ),
+        # decodes + prefills
+        (
+            ['0', '1', '2', '3'], np.array([6, 8, 0, 0]),
+            [
+                torch.tensor([0, 671, 6102, 294, 8760, 344, 88907, 0]),
+                torch.tensor([0, 19923, 14, 1026, 2329, 344, 9807, 14, 342, 0]),
+                torch.tensor([0, 671, 8749, 294, 3702, 4106, 344, 88907]),
+                torch.tensor([0, 671, 5335, 1469, 7539, 305, 6397]),
+            ],
+            4, 19, {'0': 2, '1': 2, '2': 8, '3': 7},
+            torch.tensor([88907, 0, 342, 0, 0, 671, 8749, 294, 3702, 4106, 344, 88907,
+                          0, 671, 5335, 1469, 7539, 305, 6397]),
+            torch.tensor([0, 2, 4, 12, 19])
+        ),
+    ])
+# yapf: enable
+def test_generate_pcp_mtp_input(
+    req_ids,
+    num_computed_tokens,
+    token_ids_tensor_list,
+    num_reqs,
+    total_num_scheduled_tokens,
+    num_scheduled_tokens,
+    target_input_ids_pcp_full,
+    target_query_start_loc_pcp_full,
+):
+    max_num_reqs = 4
+    max_model_len = 4096
+    max_num_tokens = 4096
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = 1
+    vllm_config.scheduler_config.max_num_seqs = max_num_reqs
+    vllm_config.scheduler_config.max_num_batched_tokens = max_model_len
+    pcp_manager = PCPManager(pcp_world_size=2,
+                             pcp_rank=0,
+                             dcp_world_size=1,
+                             dcp_rank=0,
+                             max_buffer_num_tokens=max_num_tokens,
+                             max_num_reqs=max_num_reqs,
+                             device="cpu",
+                             vllm_config=vllm_config,
+                             use_async_scheduling=False,
+                             pin_memory=False)
+    arange_np = np.arange(max_model_len)
+    input_batch = MagicMock()
+    input_batch.num_computed_tokens_cpu = \
+        np.zeros(max_num_reqs, dtype=np.int32)
+    token_ids_cpu_tensor = torch.zeros(
+        (max_num_reqs, max_model_len),
+        device="cpu",
+        dtype=torch.int32,
+    )
+    input_batch.token_ids_cpu_tensor = token_ids_cpu_tensor
+    input_batch.token_ids_cpu = token_ids_cpu_tensor.numpy()
+    token_ids_cpu_tensor = input_batch.token_ids_cpu_tensor
+
+    # Set input_batch
+    input_batch.req_ids = req_ids
+    input_batch.num_computed_tokens_cpu[:num_computed_tokens.
+                                        size] = num_computed_tokens
+    for i, token_ids_tensor in enumerate(token_ids_tensor_list):
+        token_ids_cpu_tensor[i][:token_ids_tensor.size(0)] = token_ids_tensor
+
+    pcp_manager.init_batch_info(np.array(list(num_scheduled_tokens.values())), num_reqs)
+    pcp_manager.generate_pcp_mtp_input(total_num_scheduled_tokens, num_scheduled_tokens, False,
+                                       input_batch, arange_np)
+    assert torch.equal(
+        pcp_manager.input_ids_pcp_full.cpu[:total_num_scheduled_tokens],
+        target_input_ids_pcp_full)
+    assert torch.equal(pcp_manager.query_start_loc_pcp_full.cpu[:num_reqs + 1],
+                       target_query_start_loc_pcp_full)
+
+
+def _realistic_num_pcp_pads(
+    num_scheduled_tokens: list[int],
+    pcp_world_size: int,
+    num_decode_reqs: int,
+) -> list[int]:
+    """Compute num_pcp_pads exactly as PCPManager.update_tokens_for_pcp would.
+
+    Decode reqs duplicate tokens across pcp_world_size ranks, so their pad
+    count is num_tokens * (pcp_world_size - 1). Prefill reqs are padded up
+    to a multiple of 2 * pcp_world_size, so their pad count is the difference
+    between the padded and original length.
+    """
+    pads: list[int] = []
+    pad_multiple = 2 * pcp_world_size
+    for i, n in enumerate(num_scheduled_tokens):
+        if i < num_decode_reqs:
+            pads.append(n * (pcp_world_size - 1))
+        else:
+            padded = math.ceil(n / pad_multiple) * pad_multiple
+            pads.append(padded - n)
+    return pads
+
+
+# yapf: disable
+@pytest.mark.parametrize(
+    "pcp_size, num_scheduled_tokens, num_decode_reqs,"
+    " expected_cu_num_scheduled_tokens",
+    [
+        # Case 1: no prefill reqs -> returned unchanged.
+        (2, [1, 1], 2, [1, 2]),
+        # Case 2: prefill only (num_decode_reqs == 0). Exercises the case where
+        # the diff-based per-req length derivation would otherwise drop the
+        # first req's length.
+        #   num_scheduled=[3, 5], realistic pads=[1, 3] -> cumsum=[1, 4]
+        #   cu=[3, 8]; padded prefill_lens=[4, 8]; base=0
+        #   prefill_cu=[4, 12]; final = [4*2-1, 12*2-4] = [7, 20]
+        (2, [3, 5], 0, [7, 20]),
+        # Case 3: mix decode + prefill, pcp_size=2.
+        #   num_scheduled=[1, 1, 3, 5], realistic pads=[1, 1, 1, 3]
+        #   prefill pads cumsum=[1, 4]
+        #   cu=[1, 2, 5, 10]; padded prefill_lens=[4, 8]; base=cu[1]=2
+        #   prefill_cu=[6, 14]; final[2:] = [12, 28] - [1, 4] = [11, 24]
+        (2, [1, 1, 3, 5], 2, [1, 2, 11, 24]),
+        # Case 4: pcp_size=4, mix decode + prefill with uneven prefill tokens.
+        #   num_scheduled=[1, 1, 5, 9], realistic pads=[3, 3, 3, 7]
+        #   prefill pads cumsum=[3, 10]
+        #   cu=[1, 2, 7, 16]; padded prefill_lens=[8, 16]; base=cu[1]=2
+        #   prefill_cu=[10, 26]; final[2:] = [40, 104] - [3, 10] = [37, 94]
+        (4, [1, 1, 5, 9], 2, [1, 2, 37, 94]),
+        # Case 5: single prefill req, pcp_size=2.
+        #   num_scheduled=[7], realistic pads=[1]
+        #   cu=[7]; padded prefill_lens=[8]; base=0
+        #   prefill_cu=[8]; final = [8*2-1] = [15]
+        (2, [7], 0, [15]),
+        # Case 6: prefill req that's already aligned to 2*pcp_size.
+        #   num_scheduled=[8], realistic pads=[0]
+        #   cu=[8]; padded prefill_lens=[8]; base=0
+        #   prefill_cu=[8]; final = [8*2-0] = [16]
+        (2, [8], 0, [16]),
+    ],
+)
+# yapf: enable
+def test_adjust_cu_num_scheduled_tokens_for_pcp(
+    pcp_size,
+    num_scheduled_tokens,
+    num_decode_reqs,
+    expected_cu_num_scheduled_tokens,
+):
+    vllm_config = MagicMock()
+    vllm_config.model_config = MagicMock()
+    vllm_config.speculative_config.num_speculative_tokens = 0
+
+    pcp_manager = PCPManager(
+        pcp_world_size=pcp_size,
+        pcp_rank=0,
+        dcp_world_size=1,
+        dcp_rank=0,
+        max_buffer_num_tokens=10000,
+        max_num_reqs=1000,
+        device="cpu",
+        vllm_config=vllm_config,
+        use_async_scheduling=False,
+        pin_memory=False,
+    )
+
+    num_reqs = len(num_scheduled_tokens)
+    cu_num_scheduled_tokens = np.cumsum(
+        np.array(num_scheduled_tokens, dtype=np.int32)
+    )
+    # Use realistic pads that match what update_tokens_for_pcp would produce
+    # for the given num_scheduled_tokens / pcp_world_size combination.
+    # Tests previously fed zeros for prefill pads, which made the math look
+    # correct but never exercised the real runtime path.
+    num_pcp_pads = np.array(
+        _realistic_num_pcp_pads(num_scheduled_tokens, pcp_size, num_decode_reqs),
+        dtype=np.int32,
+    )
+
+    # Seed the manager state normally populated by init_batch_info.
+    pcp_manager.num_decode_reqs = num_decode_reqs
+    pcp_manager.num_prefill_reqs = num_reqs - num_decode_reqs
+
+    result = pcp_manager.adjust_cu_num_scheduled_tokens_for_pcp(
+        cu_num_scheduled_tokens, num_pcp_pads
+    )
+
+    assert np.array_equal(
+        result, np.array(expected_cu_num_scheduled_tokens, dtype=np.int32)
+    ), (
+        f"Expected {expected_cu_num_scheduled_tokens}, got {result.tolist()}"
+    )
