@@ -1,410 +1,94 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# SPDX-FileCopyrightText: Songlin Yang, Yu Zhang
-#
-# This file contains code copied from the flash-linear-attention project.
-# The original source code was licensed under the MIT license and included
-# the following copyright notice:
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-# ruff: noqa: E501
-# mypy: ignore-errors
-import warnings
+    def generate_mtp_attention_mask_for_decode(
+        self,
+        decode_num_computed_tokens: list[int],
+        decode_num_scheduled_tokens: np.ndarray,
+    ) -> list[torch.Tensor | None]:
+        """
+        Generate MTP attention masks for decode requests in PCP mode.
 
-import torch
-from einops import rearrange
-from vllm.distributed import get_pcp_group
-from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
+        This function handles the case where decode requests with MTP (speculative decoding)
+        need attention masks computed based on the local sequence after load balancing.
 
-from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
-from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
-from .chunk_o import chunk_fwd_o  # noqa: F401
-from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from .cumsum import chunk_local_cumsum
-from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril
-from .utils import input_guard, prepare_final_chunk_indices
-from .wy_fast import recompute_w_u_fwd
+        New MTP token allocation logic (using position % cp_size):
+        - History tokens are already split via DualChunkSwap
+        - MTP tokens are allocated based on (history_len + mtp_idx) % cp_size
+        - Each rank only computes mask for tokens assigned to itself
 
-def _compact_empty_segments(cu_seqlens_host, initial_state):
-    """Drop zero-length segments so AscendC fwd_h/fwd_o indexing lines up.
+        Example:
+            - pcp=1, dcp=2 (cp_size=2)
+            - history_len=5: [a,b,c,d,e] split via DualChunkSwap
+              - cp0: [a,b,c] (positions 0,1,2) -> 3 tokens
+              - cp1: [d,e] (positions 3,4) -> 2 tokens
+            - num_scheduled_tokens=4: [f,g,h,i] (positions 5,6,7,8)
+            - MTP allocation by position % cp_size:
+              - f: pos 5 % 2 = 1 -> rank1
+              - g: pos 6 % 2 = 0 -> rank0
+              - h: pos 7 % 2 = 1 -> rank1
+              - i: pos 8 % 2 = 0 -> rank0
+            - Final:
+              - rank0: [a,b,c,g,i] positions [0,1,2,6,8] -> mask shape 4x5
+              - rank1: [d,e,f,h] positions [3,4,5,7] -> mask shape 4x4
 
-    ``chunk_indices_chunk64`` already carries COMPACT (non-empty) segment ranks
-    (see gdn_attn_builder._fill_chunk_indices_cpu), but the kernels index
-    ``gmSeqlen`` (= cu_seqlens) and ``initial_state`` by that same rank. An empty
-    segment left in cu_seqlens -- which PCP rank>0 produces for requests whose
-    context does not reach this rank -- therefore mis-indexes: chunk_fwd_o reads
-    ``batchTokens == 0`` and, on that segment's last chunk, ``blockTokens`` underflows
-    (uint32) -> MTE write OOB -> runtime 507015. This is the root cause of the
-    "concurrent mixed-batch only, rank>0 only" PCP crash: a single request never
-    yields an empty segment in the middle, but a mixed-length batch on rank>0 does.
+        Args:
+            decode_num_computed_tokens: List of global history lengths for decode requests
+            decode_num_scheduled_tokens: Array of scheduled token counts for decode requests
+        """
+        cp_rank = self.pcp_world_rank * self.dcp_world_size + self.dcp_world_rank
+        cp_size = self.pcp_world_size * self.dcp_world_size
+        assert cp_size > 1, "cp_size must be greater than 1"
 
-    Returns ``(cu_seqlens_kern, initial_state_kern, keep_meta)``: cu_seqlens /
-    initial_state with empty segments removed, plus the bool keep-mask (None when
-    nothing was removed). ``chunk_indices_chunk64`` is unchanged (already compact);
-    the compacted ``final_state`` must be scattered back to the full layout via
-    ``keep_meta`` (empty segments keep their initial state). No-op when there are no
-    empty segments (rank0 / non-PCP / uniform batch never have them).
-    """
-    if cu_seqlens_host is None:
-        return None, initial_state, None
-    cu = torch.tensor(cu_seqlens_host, dtype=torch.int64)
-    keep = (cu[1:] - cu[:-1]) > 0
-    if bool(keep.all()):
-        return cu_seqlens_host, initial_state, None
-    cu_kern = torch.cat([cu[:1], cu[1:][keep]]).tolist()
-    st_kern = initial_state[keep] if initial_state is not None else None
-    return cu_kern, st_kern, keep
+        interleave_size = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
 
+        q_lens = torch.tensor(decode_num_scheduled_tokens[: self.num_decode_reqs], dtype=torch.int32)
+        global_histories = torch.tensor(decode_num_computed_tokens, dtype=torch.int32)
+        total_lens = global_histories + q_lens
+        context_lens = total_lens - q_lens
 
-def chunk_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None = None,
-    prebuilt_meta=None,
-):
-    forward_context = get_forward_context()
-    num_decodes = 0
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is not None and isinstance(attn_metadata, dict):
-        attn_metadata = next(iter(attn_metadata.values()), None)
-    if attn_metadata is not None:
-        num_decodes = attn_metadata.num_decodes
-    chunk_size = 64
-    block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
-    cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
-    chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
-    chunk_indices_chunk64_host = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64_host
-    chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_chunk64
-    update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
-    final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
-    chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
-    g = chunk_local_cumsum(
-        g,
-        chunk_size=chunk_size,
-        cu_seqlens=cu_seqlens,
-        block_indices=block_indices_cumsum,
-    )
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-        output_dtype=torch.float32,
-    )
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_large_block=chunk_indices_large_block,
-        chunk_indices_bt=chunk_indices_chunk64,
-        output_dtype=k.dtype,
-    )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-    )
+        # Interleave-aware per-rank KV length:
+        # base = L // I // W * I, remainder = L - base * W,
+        # local = base + clip(remainder - rank * I, 0, I)
+        base_k = total_lens // interleave_size // cp_size * interleave_size
+        remainder_k = total_lens - base_k * cp_size
+        k_lens = base_k + torch.clamp(remainder_k - cp_rank * interleave_size, 0, interleave_size)
+        valid = k_lens > 0
 
-    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
-    w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
-    u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
-    g_ascendc = g.transpose(1, 2).contiguous()
-    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+        if not valid.any():
+            return self.dcp_mtp_attn_mask.cpu[: self.num_decode_reqs]
 
-    cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
-    chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
-    if cu_seqlens_host is None and cu_seqlens is not None:
-        cu_seqlens_host = tuple(cu_seqlens.tolist())
-    if chunk_indices_chunk64_host is None and chunk_indices is not None:
-        chunk_indices_chunk64_host = tuple(chunk_indices.flatten().tolist())
-    # Compact zero-length segments for the AscendC kernels (see
-    # _compact_empty_segments). chunk_indices_chunk64 is already compact-ranked and
-    # is reused as-is; only cu_seqlens / initial_state need compacting.
-    cu_seqlens_kern, initial_state_kern, keep_meta = _compact_empty_segments(
-        cu_seqlens_host, initial_state)
-    h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
-        k_ascendc,
-        w_ascendc,
-        u_ascendc,
-        g=g_ascendc,
-        gk=None,
-        initial_state=initial_state_kern,
-        output_final_state=True,
-        chunk_size=64,
-        save_new_value=True,
-        cu_seqlens=cu_seqlens_kern,
-        chunk_indices=chunk_indices_chunk64_host,
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
-    if keep_meta is not None:
-        # Scatter the compacted final_state back to the original [N, H, K, V] layout
-        # the PCP state recursion expects; empty segments keep their initial state.
-        _fs_full = initial_state.clone()
-        _fs_full[keep_meta] = final_state
-        final_state = _fs_full
+        k_lens = torch.where(valid, k_lens, torch.zeros_like(k_lens))
 
-    if get_pcp_group().world_size > 1:
-        # When integrating mtp, since `mix_qkv` has been split, `num_decode`
-        # cannot be directly obtained from the metadata and needs to be recalculated.
-        actual_num_decodes = getattr(prebuilt_meta, "num_decodes", None)
-        if actual_num_decodes is None:
-            actual_num_decodes = num_decodes
-        h_update = chunk_gated_delta_rule_fwd_hupdate(
-            k=k,
-            w=w,
-            u=u,
-            g=g,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices_chunk64,
-            chunk_offsets=chunk_offsets_chunk64,
-            update_chunk_offsets=update_chunk_offsets_chunk64,
-            num_decodes=actual_num_decodes,
-        )
-        all_final_state = get_pcp_group().all_gather(final_state.unsqueeze(0), 0)
-        final_chunk_indices = final_chunk_indices_chunk64
-        if final_chunk_indices is None:
-            final_chunk_indices = prepare_final_chunk_indices(cu_seqlens, chunk_size)
-        final_h_update = h_update[:, final_chunk_indices, :, :, :]
-        all_final_h_update = get_pcp_group().all_gather(final_h_update, 0)
+        mtp_attn_mask = self.dcp_mtp_attn_mask.cpu[: self.num_decode_reqs]
+        mtp_attn_mask.zero_()
 
-        updated_state = final_state.new_empty(get_pcp_group().world_size, *final_state.shape)
-        updated_state[0, ...] = all_final_state[0]
-        for i in range(1, get_pcp_group().world_size):
-            updated_final_state = all_final_state[i] + torch.matmul(
-                all_final_h_update[i, ...], updated_state[i - 1, ...]
-            )
-            updated_state[i, ...] = updated_final_state
+        num_valid = valid.sum().item()
+        if num_valid == 0:
+            return mtp_attn_mask
 
-        final_state = updated_state[-1, ...]
+        max_q = int(q_lens[valid].max().item())
+        max_k = int(k_lens[valid].max().item())
 
-        if get_pcp_group().rank_in_group == 0:
-            updated_h_state = torch.zeros_like(final_state)
-        else:
-            updated_h_state = updated_state[get_pcp_group().rank_in_group - 1, ...]
+        # Generate indices up to max dimensions
+        q_indices = torch.arange(max_q, dtype=torch.int32)
+        k_indices = torch.arange(max_k, dtype=torch.int32)
 
-        if get_pcp_group().rank_in_group > 0:
-            rerun_initial_state = initial_state.clone()
-            if cu_seqlens is not None:
-                _ns_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-                prefill_seq_offset = int(((_ns_lens > 0) & (_ns_lens <= 1)).sum().item())
-            else:
-                prefill_seq_offset = num_decodes
-            prefill_slice = slice(prefill_seq_offset, final_state.shape[0])
-            rerun_initial_state[prefill_slice] = updated_h_state[prefill_slice]
-            h, v_new, _ = chunk_gated_delta_rule_fwd_h(
-                k=k,
-                w=w,
-                u=u,
-                g=g,
-                initial_state=rerun_initial_state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices_chunk64,
-                chunk_offsets=chunk_offsets_chunk64,
-            )
-            h = h.transpose(1, 2).contiguous()
-            v_new = v_new.transpose(1, 2).contiguous()
+        valid_q = valid[:, None] & (q_indices[None, :] < q_lens[:, None])
+        valid_k = valid[:, None] & (k_indices[None, :] < k_lens[:, None])
 
-    o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
-        q_ascendc,
-        k_ascendc,
-        v_new,
-        h,
-        scale,
-        g=g_ascendc,
-        g_gamma=None,
-        cu_seqlens=cu_seqlens_kern,
-        chunk_indices=chunk_indices_chunk64_host,
-        chunk_size=64,
-        transpose_state_layout=False,
-    )
+        # Interleave-aware k_upper: for query token at global position P,
+        # the number of rank-cp_rank KV tokens before P (exclusive upper bound).
+        positions = context_lens[:, None] + q_indices[None, :]  # [num_decode_reqs, max_q]
+        base_q = positions // interleave_size // cp_size * interleave_size
+        remainder_q = positions - base_q * cp_size
+        local_q = base_q + torch.clamp(remainder_q - cp_rank * interleave_size, 0, interleave_size)
+        k_upper = local_q - 1  # inclusive upper KV index
 
-    o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
-    v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
-    h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+        k_upper_expanded = k_upper[:, :, None]  # [num_decode_reqs, max_q, 1]
+        k_idx_expanded = k_indices[None, None, :]  # [1, 1, max_k]
+        full_mask = (k_idx_expanded > k_upper_expanded) & (k_upper_expanded >= 0)
 
-    if SUPPRESS_LEVEL < 3:
-        return g, o, A, final_state, None, None, None
-    elif SUPPRESS_LEVEL >= 3:
-        return g, o, A, final_state, w, h, v_new
+        valid_mask_3d = valid_q[:, :, None] & valid_k[:, None, :]
+        full_mask = full_mask & valid_mask_3d
 
+        mtp_attn_mask[: self.num_decode_reqs, :max_q, :max_k] = full_mask
 
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-    @staticmethod
-    @input_guard
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        scale: float,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.LongTensor | None = None,
-        prebuilt_meta=None,
-        use_qk_l2norm_in_kernel: bool = False,
-    ):
-        if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
-        g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            prebuilt_meta=prebuilt_meta,
-        )
-        ctx.scale = scale
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        return o.to(q.dtype), final_state
-
-
-@torch.compiler.disable
-def chunk_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    prebuilt_meta=None,
-    head_first: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    chunk_indices: torch.Tensor | None = None,
-    chunk_offsets: torch.Tensor | None = None,
-    core_attn_out: torch.Tensor | None = None,
-):
-    r"""
-    Args:
-        q (torch.Tensor):
-            queries of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
-        k (torch.Tensor):
-            keys of shape `[B, T, H, K]` if `head_first=False` else `[B, H, T, K]`.
-        v (torch.Tensor):
-            values of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
-        g (torch.Tensor):
-            (forget) gating tensor (in log space!) of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
-        beta (torch.Tensor):
-            betas of shape `[B, T, H]` if `head_first=False` else `[B, H, T]`.
-        scale (Optional[int]):
-            Scale factor for the RetNet attention scores.
-            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, H, K, V]` for `N` input sequences.
-            For equal-length input sequences, `N` equals the batch size `B`.
-            Default: `None`.
-        output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
-        cu_seqlens (torch.LongTensor):
-            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-        head_first (Optional[bool]):
-            Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
-            Default: `False`.
-
-    Returns:
-        o (torch.Tensor):
-            Outputs of shape `[B, T, H, V]` if `head_first=False` else `[B, H, T, V]`.
-        final_state (torch.Tensor):
-            Final state of shape `[N, H, K, V]` if `output_final_state=True` else `None`.
-
-    Examples::
-        >>> import torch
-        >>> import torch.nn.functional as F
-        >>> from einops import rearrange
-        >>> from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-        # inputs with equal lengths
-        >>> B, T, H, K, V = 4, 2048, 4, 512, 512
-        >>> q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda')
-        >>> k = F.normalize(torch.randn(B, T, H, K, dtype=torch.bfloat16, device='cuda'), p=2, dim=-1)
-        >>> v = torch.randn(B, T, H, V, dtype=torch.bfloat16, device='cuda')
-        >>> beta = torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda').sigmoid()
-        >>> g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.bfloat16, device='cuda'))
-        >>> h0 = torch.randn(B, H, K, V, dtype=torch.bfloat16, device='cuda')
-        >>> o, ht = chunk_gated_delta_rule(
-            q, k, v, g, beta,
-            initial_state=h0,
-            output_final_state=True
-        )
-        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
-        >>> q, k, v, beta, g = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, beta, g))
-        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
-        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
-        >>> o_var, ht_var = chunk_gated_delta_rule(
-            q, k, v, g, beta,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens
-        )
-    """
-    assert q.dtype == k.dtype == v.dtype
-    assert q.dtype != torch.float32, "ChunkGatedDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert len(beta.shape) == 3, "beta must be of shape [B, T, H] if head_first=False, or [B, H, T] otherwise."
-
-    if head_first:
-        raise DeprecationWarning(
-            "chunk_gated_delta_rule: head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead.",
-            stacklevel=2,
-        )
-        q, k, v, beta, g = map(lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g))
-    if not head_first and q.shape[1] < q.shape[2]:
-        warnings.warn(
-            f"chunk_gated_delta_rule: Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
-            "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
-            "when head_first=False was specified. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
-            stacklevel=2,
-        )
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"chunk_gated_delta_rule: The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"chunk_gated_delta_rule: The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
-            )
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        prebuilt_meta,
-        use_qk_l2norm_in_kernel,
-    )
-    if head_first:
-        o = rearrange(o, "b t h ... -> b h t ...")
-    return o, final_state
+        return mtp_attn_mask
