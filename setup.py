@@ -1,94 +1,539 @@
-    def generate_mtp_attention_mask_for_decode(
-        self,
-        decode_num_computed_tokens: list[int],
-        decode_num_scheduled_tokens: np.ndarray,
-    ) -> list[torch.Tensor | None]:
-        """
-        Generate MTP attention masks for decode requests in PCP mode.
+#
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2023 The vLLM team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+"""PCP/DCP long-sequence accuracy guards.
 
-        This function handles the case where decode requests with MTP (speculative decoding)
-        need attention masks computed based on the local sequence after load balancing.
+Run `pytest tests/e2e/pull_request/four_card/context_parallel/test_accuracy.py`.
+"""
 
-        New MTP token allocation logic (using position % cp_size):
-        - History tokens are already split via DualChunkSwap
-        - MTP tokens are allocated based on (history_len + mtp_idx) % cp_size
-        - Each rank only computes mask for tokens assigned to itself
+import os
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+from unittest.mock import patch
 
-        Example:
-            - pcp=1, dcp=2 (cp_size=2)
-            - history_len=5: [a,b,c,d,e] split via DualChunkSwap
-              - cp0: [a,b,c] (positions 0,1,2) -> 3 tokens
-              - cp1: [d,e] (positions 3,4) -> 2 tokens
-            - num_scheduled_tokens=4: [f,g,h,i] (positions 5,6,7,8)
-            - MTP allocation by position % cp_size:
-              - f: pos 5 % 2 = 1 -> rank1
-              - g: pos 6 % 2 = 0 -> rank0
-              - h: pos 7 % 2 = 1 -> rank1
-              - i: pos 8 % 2 = 0 -> rank0
-            - Final:
-              - rank0: [a,b,c,g,i] positions [0,1,2,6,8] -> mask shape 4x5
-              - rank1: [d,e,f,h] positions [3,4,5,7] -> mask shape 4x4
+import pytest
+from PIL import Image
+from vllm import SamplingParams
 
-        Args:
-            decode_num_computed_tokens: List of global history lengths for decode requests
-            decode_num_scheduled_tokens: Array of scheduled token counts for decode requests
-        """
-        cp_rank = self.pcp_world_rank * self.dcp_world_size + self.dcp_world_rank
-        cp_size = self.pcp_world_size * self.dcp_world_size
-        assert cp_size > 1, "cp_size must be greater than 1"
+from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
-        interleave_size = self.vllm_config.parallel_config.cp_kv_cache_interleave_size
+DEEPSEEK_V2_LITE = "vllm-ascend/DeepSeek-V2-Lite-W8A8"
+DEEPSEEK_MTP = "wemaster/deepseek_mtp_main_random_bf16"
+MAX_NUM_SEQS = 4
+E2E_ROOT = Path(__file__).resolve().parents[3]
+QWEN_IMAGE_PATH = E2E_ROOT / "prompts" / "qwen.png"
 
-        q_lens = torch.tensor(decode_num_scheduled_tokens[: self.num_decode_reqs], dtype=torch.int32)
-        global_histories = torch.tensor(decode_num_computed_tokens, dtype=torch.int32)
-        total_lens = global_histories + q_lens
-        context_lens = total_lens - q_lens
+FULL_DECODE_GRAPH = {
+    "cudagraph_mode": "FULL_DECODE_ONLY",
+    "cudagraph_capture_sizes": [MAX_NUM_SEQS],
+}
 
-        # Interleave-aware per-rank KV length:
-        # base = L // I // W * I, remainder = L - base * W,
-        # local = base + clip(remainder - rank * I, 0, I)
-        base_k = total_lens // interleave_size // cp_size * interleave_size
-        remainder_k = total_lens - base_k * cp_size
-        k_lens = base_k + torch.clamp(remainder_k - cp_rank * interleave_size, 0, interleave_size)
-        valid = k_lens > 0
+COMMON_PROMPTS = [
+    "The capital of France is",
+    "Hello, my name is Tom, I am",
+    "The president of United States is",
+]
 
-        if not valid.any():
-            return self.dcp_mtp_attn_mask.cpu[: self.num_decode_reqs]
+DSV2_PROMPTS = [
+    "The president of the United States is",
+    "The capital of France is",
+]
 
-        k_lens = torch.where(valid, k_lens, torch.zeros_like(k_lens))
+DSV2_PCP_GOLDEN = [
+    "The president of the United States is a man who is not only a liar, but",
+    "The capital of France is Paris.\nThe currency of France is the Euro",
+]
 
-        mtp_attn_mask = self.dcp_mtp_attn_mask.cpu[: self.num_decode_reqs]
-        mtp_attn_mask.zero_()
+DSV2_DCP_GOLDEN = [
+    "The president of the United States is a man who is not only a liar, but",
+    "The capital of France is Paris.\nThe currency of France is the Euro",
+]
 
-        num_valid = valid.sum().item()
-        if num_valid == 0:
-            return mtp_attn_mask
+QWEN3_GOLDEN = [
+    "The capital of France is Paris. The capital of",
+    "Hello, my name is Tom, I am 12 years old",
+    "The president of United States is the head of state and",
+]
 
-        max_q = int(q_lens[valid].max().item())
-        max_k = int(k_lens[valid].max().item())
+QWEN3_NEXT_GOLDEN = [
+    "The capital of France is Paris. The capital of",
+    "Hello, my name is Tom, I am 12 years old",
+    "The president of United States is the head of state and",
+]
 
-        # Generate indices up to max dimensions
-        q_indices = torch.arange(max_q, dtype=torch.int32)
-        k_indices = torch.arange(max_k, dtype=torch.int32)
+DSV3_2_GOLDEN = [
+    "The capital of France isbearerhaloce梗",
+    "Hello, my name is Tom, I am" + "ERIC slicpacelike Chop",
+    "The president of United States is平行astra unbehetroni",
+]
 
-        valid_q = valid[:, None] & (q_indices[None, :] < q_lens[:, None])
-        valid_k = valid[:, None] & (k_indices[None, :] < k_lens[:, None])
+DSV3_2_GOLDEN_BACKUPS = (
+    [
+        "The capital of France isbearerhaloce梗",
+        "Hello, my name is Tom, I am" + "ERIC slicpacelike Chop",
+        "The president of United States isoint054 Rund959arki",
+    ],
+    [
+        "The capital of France isbearerdenomorthal",
+        "Hello, my name is Tom, I am" + "ERIC slicpacelike Chop",
+        "The president of United States is平行astra unbehetroni",
+    ],
+    [
+        "The capital of France isbearerdenomorthal",
+        "Hello, my name is Tom, I am" + "ERIC slicpacelike Chop",
+        "The president of United States isoint054 Rund959arki",
+    ],
+)
 
-        # Interleave-aware k_upper: for query token at global position P,
-        # the number of rank-cp_rank KV tokens before P (exclusive upper bound).
-        positions = context_lens[:, None] + q_indices[None, :]  # [num_decode_reqs, max_q]
-        base_q = positions // interleave_size // cp_size * interleave_size
-        remainder_q = positions - base_q * cp_size
-        local_q = base_q + torch.clamp(remainder_q - cp_rank * interleave_size, 0, interleave_size)
-        k_upper = local_q - 1  # inclusive upper KV index
+DSV3_2_DCP_GOLDEN = [
+    "The capital of France isoint054 Rund959arki",
+    "Hello, my name is Tom, I am" + "ERIC slicpacelikeabra",
+    "The president of United States isoint054 Rund959arki",
+]
 
-        k_upper_expanded = k_upper[:, :, None]  # [num_decode_reqs, max_q, 1]
-        k_idx_expanded = k_indices[None, None, :]  # [1, 1, max_k]
-        full_mask = (k_idx_expanded > k_upper_expanded) & (k_upper_expanded >= 0)
+DEEPSEEK_MTP3_GOLDEN = [
+    "The capital of France is Salmonella团团 elsewhereッγκ",
+    "Hello, my name is Tom, I amEiSlowukt Analysis sprouts",
+    "The president of United States is Salmonella团团 elsewhereッγκ",
+]
 
-        valid_mask_3d = valid_q[:, :, None] & valid_k[:, None, :]
-        full_mask = full_mask & valid_mask_3d
+DEEPSEEK_V4_PROMPTS = [
+    "Hello, my name is",
+    "What is the meaning of life?",
+]
 
-        mtp_attn_mask[: self.num_decode_reqs, :max_q, :max_k] = full_mask
+DEEPSEEK_V4_GOLDEN = ["Hello, my name is {name} and I", 'What is the meaning of life?",\n    "What is']
 
-        return mtp_attn_mask
+
+@dataclass(frozen=True)
+class AccuracyCase:
+    name: str
+    model: str
+    prompts: Sequence[str]
+    expected_outputs: Sequence[str] | Sequence[Sequence[str]]
+    max_tokens: int
+    runner_kwargs: dict[str, Any]
+
+
+def _run_accuracy_case(case: AccuracyCase) -> None:
+    with VllmRunner(case.model, **case.runner_kwargs) as runner:
+        outputs = runner.generate_greedy(list(case.prompts), case.max_tokens)
+
+    if isinstance(case.expected_outputs[0], str):
+        expected_outputs = cast(Sequence[str], case.expected_outputs)
+        match_outputs_with_goldens(outputs, expected_outputs)
+    else:
+        # If multiple expected output sets are provided, the output is considered correct if it matches any of the sets.
+        multi_expected_outputs = cast(Sequence[Sequence[str]], case.expected_outputs)
+        tries = []
+        for expected in multi_expected_outputs:
+            try:
+                match_outputs_with_goldens(outputs, expected)
+            except AssertionError as exc:
+                tries.append(f"Output did not match expected set:\n{exc}")
+            else:
+                break
+        if len(tries) == len(multi_expected_outputs):
+            failure_details = "\n\n".join(tries)
+            raise AssertionError(f"Output did not match any of the expected output sets:\n{failure_details}")
+
+
+def match_outputs_with_goldens(outputs: list[tuple[list[int], str]], goldens: Sequence[str]) -> None:
+    """Helper function to compare output with golden output, ignoring whitespace differences."""
+    outputs_str: Sequence[str] = [output[1] for output in outputs]
+    assert len(outputs_str) == len(goldens)
+    for index, (output, golden) in enumerate(zip(outputs_str, goldens)):
+        assert isinstance(output, str) and isinstance(golden, str), "Both output and golden must be strings"
+        assert output and golden, "Output and golden should not be empty"
+        assert output.strip() == golden.strip()
+
+
+@patch.dict(
+    os.environ,
+    {
+        "HCCL_BUFFSIZE": "768",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "OMP_NUM_THREADS": "1",
+        "OMP_PROC_BIND": "false",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+def test_qwen3_vl_multimodal_pcp_accuracy_guard() -> None:
+    image = Image.open(QWEN_IMAGE_PATH).convert("RGB")
+    single_image_prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "Describe this image in detail.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    multi_image_prompt = (
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "Compare these two images and describe similarities.<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    inputs = [
+        {
+            "prompt": single_image_prompt,
+            "multi_modal_data": {"image": image},
+        },
+        {
+            "prompt": multi_image_prompt,
+            "multi_modal_data": {"image": [image, image.copy()]},
+        },
+    ]
+    sampling_params = SamplingParams(max_tokens=16, temperature=0.0)
+
+    with VllmRunner(
+        "Qwen/Qwen3-VL-8B-Instruct",
+        enforce_eager=False,
+        max_model_len=4096,
+        tensor_parallel_size=2,
+        prefill_context_parallel_size=2,
+        decode_context_parallel_size=1,
+        max_num_batched_tokens=1024,
+        block_size=128,
+        limit_mm_per_prompt={"image": 2},
+        mm_processor_kwargs={
+            "min_pixels": 28 * 28,
+            "max_pixels": 1280 * 28 * 28,
+            "fps": 1,
+        },
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "cudagraph_capture_sizes": [MAX_NUM_SEQS],
+        },
+    ) as runner:
+        outputs = runner.model.generate(inputs, sampling_params=sampling_params)
+
+    assert len(outputs) == len(inputs)
+    for output in outputs:
+        assert output.outputs and output.outputs[0].text.strip()
+
+
+DSV2_COMMON_KWARGS: dict[str, Any] = {
+    "max_model_len": 1024,
+    "max_num_seqs": MAX_NUM_SEQS,
+    "max_num_batched_tokens": 1024,
+    "enable_expert_parallel": True,
+    "enable_chunked_prefill": True,
+    "enable_prefix_caching": True,
+    "block_size": 128,
+    "quantization": "ascend",
+    "compilation_config": FULL_DECODE_GRAPH,
+    "additional_config": {"enable_flashcomm1": True},
+}
+
+DSV2_PARALLEL_CASES = [
+    AccuracyCase(
+        name="dsv2_pcp_dcp_full_features",
+        model=DEEPSEEK_V2_LITE,
+        prompts=DSV2_PROMPTS,
+        expected_outputs=DSV2_PCP_GOLDEN,
+        max_tokens=10,
+        runner_kwargs={
+            **DSV2_COMMON_KWARGS,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 2,
+            "decode_context_parallel_size": 2,
+            "cp_kv_cache_interleave_size": 128,
+            "long_prefill_token_threshold": 4,
+        },
+    ),
+    AccuracyCase(
+        name="dsv2_pcp_only_full_features",
+        model=DEEPSEEK_V2_LITE,
+        prompts=DSV2_PROMPTS,
+        expected_outputs=DSV2_PCP_GOLDEN,
+        max_tokens=10,
+        runner_kwargs={
+            **DSV2_COMMON_KWARGS,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 2,
+            "decode_context_parallel_size": 1,
+            "cp_kv_cache_interleave_size": 128,
+            "long_prefill_token_threshold": 4,
+        },
+    ),
+    AccuracyCase(
+        name="dsv2_dcp_only_full_features",
+        model=DEEPSEEK_V2_LITE,
+        prompts=DSV2_PROMPTS,
+        expected_outputs=DSV2_DCP_GOLDEN,
+        max_tokens=10,
+        runner_kwargs={
+            **DSV2_COMMON_KWARGS,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 2,
+            "long_prefill_token_threshold": 64,
+            "compilation_config": {
+                **FULL_DECODE_GRAPH,
+                "pass_config": {"enable_sp": True},
+            },
+        },
+    ),
+    AccuracyCase(
+        name="dsv2_dcp_only_interleave128",
+        model=DEEPSEEK_V2_LITE,
+        prompts=DSV2_PROMPTS,
+        expected_outputs=DSV2_DCP_GOLDEN,
+        max_tokens=10,
+        runner_kwargs={
+            **DSV2_COMMON_KWARGS,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 2,
+            "cp_kv_cache_interleave_size": 128,
+            "long_prefill_token_threshold": 64,
+            "compilation_config": {
+                **FULL_DECODE_GRAPH,
+                "pass_config": {"enable_sp": True},
+            },
+        },
+    ),
+]
+
+FULL_FEATURE_MODEL_CASES = [
+    AccuracyCase(
+        name="qwen3_pcp_dcp_full_features",
+        model="vllm-ascend/Qwen3-30B-A3B-W8A8",
+        prompts=COMMON_PROMPTS,
+        expected_outputs=QWEN3_GOLDEN,
+        max_tokens=5,
+        runner_kwargs={
+            "max_model_len": 1024,
+            "max_num_seqs": MAX_NUM_SEQS,
+            "max_num_batched_tokens": 1024,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 2,
+            "decode_context_parallel_size": 1,
+            "enable_expert_parallel": True,
+            "enable_chunked_prefill": True,
+            "enable_prefix_caching": True,
+            "block_size": 128,
+            "quantization": "ascend",
+            "long_prefill_token_threshold": 4,
+            "compilation_config": FULL_DECODE_GRAPH,
+            "additional_config": {"enable_flashcomm1": True},
+        },
+    ),
+    AccuracyCase(
+        name="qwen3_next_pcp_dcp_full_features",
+        model="Qwen/Qwen3-Next-80B-A3B-Instruct",
+        prompts=COMMON_PROMPTS,
+        expected_outputs=QWEN3_NEXT_GOLDEN,
+        max_tokens=5,
+        runner_kwargs={
+            "enforce_eager": True,
+            "max_model_len": 1024,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 2,
+            "decode_context_parallel_size": 1,
+            "max_num_batched_tokens": 1024,
+            "enable_expert_parallel": True,
+            # TODO(qcs): We should set `long_prefill_token_threshold` to 4
+            # when chunked prefill with PCP is stable.
+            "long_prefill_token_threshold": 128,
+            "gpu_memory_utilization": 0.8,
+            "block_size": 128,
+            # FlashComm1 is disabled for qwen3_next until the PCP decode path is fixed.
+            "additional_config": {"enable_flashcomm1": False},
+        },
+    ),
+    AccuracyCase(
+        name="dsv3_2_pcp_dcp_full_features",
+        model="vllm-ascend/DeepSeek-V3.2-W8A8-Pruning",
+        prompts=COMMON_PROMPTS,
+        # TODO(qcs): Remove multi-expected_outputs after the first request output is stable.
+        expected_outputs=(DSV3_2_GOLDEN, *DSV3_2_GOLDEN_BACKUPS),
+        max_tokens=5,
+        runner_kwargs={
+            "max_model_len": 1024,
+            "max_num_seqs": MAX_NUM_SEQS,
+            "max_num_batched_tokens": 1024,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 2,
+            "decode_context_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "enable_chunked_prefill": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.2,
+            "cp_kv_cache_interleave_size": 128,
+            "block_size": 128,
+            "quantization": "ascend",
+            # TODO(qcs): We should set `long_prefill_token_threshold` to 4
+            # when chunked prefill with PCP is stable.
+            "long_prefill_token_threshold": 128,
+            "compilation_config": FULL_DECODE_GRAPH,
+            "additional_config": {"enable_flashcomm1": True},
+            # graph_mode is disabled for dsv32 until the PCP gatherv3 out of index issue is fixed.
+            "enforce_eager": True,
+        },
+    ),
+    AccuracyCase(
+        name="dsv3_2_sfa_dcp_replicated_indexer",
+        model="vllm-ascend/DeepSeek-V3.2-W8A8-Pruning",
+        prompts=COMMON_PROMPTS,
+        expected_outputs=DSV3_2_DCP_GOLDEN,
+        max_tokens=5,
+        runner_kwargs={
+            "max_model_len": 1024,
+            "max_num_seqs": MAX_NUM_SEQS,
+            "max_num_batched_tokens": 1024,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "enable_chunked_prefill": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.4,
+            "cp_kv_cache_interleave_size": 1,
+            "block_size": 128,
+            "quantization": "ascend",
+            "long_prefill_token_threshold": 128,
+            "compilation_config": FULL_DECODE_GRAPH,
+            "additional_config": {
+                "enable_flashcomm1": True,
+                "enable_sparse_c8": False,
+            },
+            "speculative_config": {
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+            },
+        },
+    ),
+    AccuracyCase(
+        name="dsv3_2_sfa_dcp_replicated_indexer_interleave128",
+        model="vllm-ascend/DeepSeek-V3.2-W8A8-Pruning",
+        prompts=COMMON_PROMPTS,
+        expected_outputs=DSV3_2_DCP_GOLDEN,
+        max_tokens=5,
+        runner_kwargs={
+            "max_model_len": 1024,
+            "max_num_seqs": MAX_NUM_SEQS,
+            "max_num_batched_tokens": 1024,
+            "tensor_parallel_size": 2,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 2,
+            "enable_expert_parallel": True,
+            "enable_chunked_prefill": True,
+            "enable_prefix_caching": True,
+            "gpu_memory_utilization": 0.4,
+            "cp_kv_cache_interleave_size": 128,
+            "block_size": 128,
+            "quantization": "ascend",
+            "long_prefill_token_threshold": 128,
+            "compilation_config": FULL_DECODE_GRAPH,
+            "additional_config": {
+                "enable_flashcomm1": True,
+                "enable_sparse_c8": False,
+            },
+            "speculative_config": {
+                "method": "mtp",
+                "num_speculative_tokens": 3,
+            },
+        },
+    ),
+    pytest.param(
+        AccuracyCase(
+            name="deepseek_mtp3_pcp_dcp_full_features",
+            model=DEEPSEEK_MTP,
+            prompts=COMMON_PROMPTS,
+            expected_outputs=DEEPSEEK_MTP3_GOLDEN,
+            max_tokens=5,
+            runner_kwargs={
+                "max_model_len": 1024,
+                "max_num_seqs": MAX_NUM_SEQS,
+                "max_num_batched_tokens": 1024,
+                "tensor_parallel_size": 2,
+                "prefill_context_parallel_size": 2,
+                "decode_context_parallel_size": 2,
+                "enable_expert_parallel": True,
+                "enable_chunked_prefill": True,
+                "enable_prefix_caching": True,
+                "block_size": 128,
+                "long_prefill_token_threshold": 4,
+                "speculative_config": {
+                    "method": "mtp",
+                    "num_speculative_tokens": 3,
+                },
+                "compilation_config": FULL_DECODE_GRAPH,
+                "additional_config": {"enable_flashcomm1": True},
+            },
+        ),
+        marks=pytest.mark.skip(reason="Temporarily skip MTP with PCP/DCP until the token layout issue is fixed."),
+    ),
+    AccuracyCase(
+        name="deepseek_v4_w4a8_dsa_cp_full_features",
+        model="gdydems/DeepSeek-V4-Flash-w4a8-mtp",
+        prompts=DEEPSEEK_V4_PROMPTS,
+        expected_outputs=DEEPSEEK_V4_GOLDEN,
+        max_tokens=5,
+        runner_kwargs={
+            "max_model_len": 8192,
+            "max_num_seqs": 16,
+            "max_num_batched_tokens": 4096,
+            "dtype": "auto",
+            "tensor_parallel_size": 4,
+            "prefill_context_parallel_size": 1,
+            "decode_context_parallel_size": 1,
+            "enable_expert_parallel": True,
+            "gpu_memory_utilization": 0.9,
+            "quantization": "ascend",
+            "tokenizer_mode": "deepseek_v4",
+            "block_size": 128,
+            "compilation_config": {
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+            },
+            "additional_config": {
+                "enable_flashcomm1": True,
+                "enable_dsa_cp": True,
+            },
+        },
+    ),
+]
+
+
+@patch.dict(
+    os.environ,
+    {
+        "HCCL_BUFFSIZE": "768",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+@pytest.mark.parametrize("case", DSV2_PARALLEL_CASES, ids=lambda case: case.name)
+def test_dsv2_lite_parallel_config_accuracy(case: AccuracyCase) -> None:
+    _run_accuracy_case(case)
+
+
+@patch.dict(
+    os.environ,
+    {
+        "HCCL_BUFFSIZE": "768",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+@pytest.mark.parametrize("case", FULL_FEATURE_MODEL_CASES, ids=lambda case: case.name)
+def test_models_pcp_dcp_full_feature_accuracy(case: AccuracyCase) -> None:
+    _run_accuracy_case(case)
