@@ -42,7 +42,10 @@ PCP_FULL_DECODE_GRAPH = {
     "cudagraph_capture_sizes": [4, 8],
 }
 
-DSV3_2_MODEL = "vllm-ascend/DeepSeek-V3.2-W8A8-Pruning"
+DSV3_2_MODEL = os.getenv(
+    "DSV3_2_MODEL_PATH",
+    "vllm-ascend/DeepSeek-V3.2-W8A8-Pruning",
+)
 DSV3_2_PROMPTS = [
     "The capital of France is",
     "Hello, my name is Tom, I am",
@@ -254,6 +257,52 @@ def test_dsv3_2_sfa_pcp_model_runner_v2_graph_accuracy() -> None:
 def test_dsv3_2_sfa_pcp_dcp_model_runner_v2_graph_accuracy() -> None:
     """Guard MRV2 SFA PCP+DCP full-decode-only graph accuracy."""
     _run_accuracy_case(DSV3_2_SFA_PCP_DCP_CASE)
+
+
+@pytest.mark.e2e_model(DSV3_2_MODEL)
+@pytest.mark.e2e_coverage(
+    arch="moe",
+    feature="sfa_pcp,chunked_prefill,prefix_caching",
+    parallel="DP,EP,PCP",
+    deploy="pd_mix",
+    hardware="A3",
+    quantization="W8A8",
+    graph_mode="full_decode_only",
+)
+@patch.dict(
+    os.environ,
+    {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "HCCL_BUFFSIZE": "768",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+def test_dsv3_2_sfa_pcp_dp_model_runner_v2_graph() -> None:
+    """Guard MRV2 SFA PCP execution with two data-parallel replicas."""
+    with DPVllmRunner(
+        DSV3_2_MODEL,
+        data_parallel_size=2,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=2,
+        enable_expert_parallel=True,
+        max_model_len=1024,
+        max_num_seqs=MAX_NUM_SEQS,
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.8,
+        cp_kv_cache_interleave_size=128,
+        block_size=128,
+        quantization="ascend",
+        enable_chunked_prefill=True,
+        enable_prefix_caching=True,
+        compilation_config=FULL_DECODE_GRAPH,
+        distributed_executor_backend="mp",
+    ) as runner:
+        outputs = runner.generate_greedy(DSV3_2_PROMPTS, max_tokens=5)
+
+    assert len(outputs) == len(DSV3_2_PROMPTS)
+    assert all(token_ids for token_ids, _ in outputs)
 
 
 def _run_pcp_spec_decode(
