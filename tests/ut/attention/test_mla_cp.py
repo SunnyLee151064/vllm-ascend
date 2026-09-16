@@ -28,6 +28,7 @@ from vllm_ascend.attention.mla_v1 import (
 
 def test_mla_dcp_extends_v1_backend() -> None:
     assert AscendMlaDCPImpl.can_return_lse_for_decode
+    assert AscendMlaDCPImpl.supports_mtp_with_cp_non_trivial_interleave_size
     assert issubclass(AscendMlaDCPImpl, AscendMLAImpl)
     assert issubclass(
         AscendMlaDCPMetadataBuilder,

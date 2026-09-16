@@ -85,6 +85,10 @@ DSV3_2_SFA_DCP_GOLDENS = (
     ],
 )
 MTP_PCP_MODEL = "wemaster/deepseek_mtp_main_random_bf16"
+MTP_MLA_MODEL = os.getenv(
+    "MTP_MLA_MODEL_PATH",
+    MTP_PCP_MODEL,
+)
 EAGLE3_PCP_TARGET_MODEL = "Qwen/Qwen3-8B"
 EAGLE3_PCP_DRAFT_MODEL = "RedHatAI/Qwen3-8B-speculator.eagle3"
 
@@ -445,6 +449,65 @@ def test_mtp_mla_spec_decode_with_pcp() -> None:
             "num_speculative_tokens": 3,
         },
     )
+
+
+def _run_dcp_spec_decode(model: str) -> None:
+    sampling_params = SamplingParams(max_tokens=16, temperature=0.0)
+    with VllmRunner(
+        model,
+        tensor_parallel_size=2,
+        decode_context_parallel_size=2,
+        max_model_len=1024,
+        max_num_batched_tokens=64,
+        max_num_seqs=2,
+        disable_log_stats=False,
+        distributed_executor_backend="mp",
+        enable_chunked_prefill=True,
+        cp_kv_cache_interleave_size=128,
+        block_size=128,
+        compilation_config=MLA_DCP_FULL_DECODE_GRAPH,
+        speculative_config={
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+        },
+    ) as runner:
+        outputs = runner.model.generate(MLA_DCP_PROMPTS, sampling_params)
+        metrics = runner.model.get_metrics()
+        num_drafts = sum(
+            metric.value
+            for metric in metrics
+            if metric.name == "vllm:spec_decode_num_drafts"
+        )
+
+    token_ids = [output.outputs[0].token_ids for output in outputs]
+    assert len(token_ids) == len(MLA_DCP_PROMPTS)
+    assert all(token_ids)
+    assert num_drafts > 0
+
+
+@pytest.mark.e2e_model(MTP_MLA_MODEL)
+@pytest.mark.e2e_coverage(
+    arch="moe",
+    feature="mtp,chunked_prefill",
+    parallel="TP,DCP",
+    deploy="pd_mix",
+    hardware="A3",
+    quantization="BF16",
+    graph_mode="full_decode_only",
+)
+@patch.dict(
+    os.environ,
+    {
+        "VLLM_USE_V2_MODEL_RUNNER": "1",
+        "VLLM_BATCH_INVARIANT": "0",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "HCCL_BUFFSIZE": "1024",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+def test_mtp_mla_spec_decode_with_dcp() -> None:
+    """Guard MRV2 MTP MLA DCP full-decode-only graph execution."""
+    _run_dcp_spec_decode(MTP_MLA_MODEL)
 
 
 @pytest.mark.e2e_model(EAGLE3_PCP_TARGET_MODEL, EAGLE3_PCP_DRAFT_MODEL)

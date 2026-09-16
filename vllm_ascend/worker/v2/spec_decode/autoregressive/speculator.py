@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegress
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.context_parallel.common_cp import get_dcp_local_seq_lens
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -491,6 +492,10 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                 if metadata is None:
                     continue
                 metadata.attn_state = AscendAttentionState.DecodeOnly
+            # Eager draft decode consumes this metadata immediately. Refresh its
+            # host-side FIA lengths before the forward, not after it.
+            if query_start_loc_np is None and num_query_per_req == 1:
+                self._update_decode_attn_metadata(attn_metadata, step, num_reqs)
         return attn_metadata
 
     def build_draft_attn_metadatas(
@@ -589,6 +594,25 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             num_reqs = num_reqs_padded
         next_seq_lens_cpu = self._calc_next_seq_lens_cpu(seq_lens_cpu, num_reqs, num_reqs_padded, step)
 
+        cp_seq_len = None
+        cp_history_seq_len = None
+        cp_size = int(getattr(self.block_tables, "cp_size", 1))
+        if self.attn_architecture == "MLA" and cp_size > 1:
+            cp_rank = int(self.block_tables.cp_rank)
+            cp_interleave = int(self.block_tables.cp_interleave)
+            local_seq_lens = get_dcp_local_seq_lens(
+                next_seq_lens_cpu, cp_size, cp_interleave
+            )
+            cp_seq_len = local_seq_lens[:, cp_rank].tolist()
+
+            draft_query_lens = torch.zeros_like(next_seq_lens_cpu)
+            draft_query_lens[:num_reqs].fill_(1)
+            history_seq_lens = (next_seq_lens_cpu - draft_query_lens).clamp(min=0)
+            local_history_lens = get_dcp_local_seq_lens(
+                history_seq_lens, cp_size, cp_interleave
+            )
+            cp_history_seq_len = local_history_lens[:, cp_rank].tolist()
+
         query_lens_list = [i for i in range(1, num_reqs_padded + 1)]
         seq_lens_list = next_seq_lens_cpu.tolist()
         for metadata in attn_metadata.values():
@@ -598,6 +622,9 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
                 decode_metadata = metadata
             decode_metadata.seq_lens_list = seq_lens_list
             decode_metadata.actual_seq_lengths_q = query_lens_list
+            if cp_seq_len is not None and hasattr(decode_metadata, "cp_seq_len"):
+                decode_metadata.cp_seq_len = cp_seq_len
+                decode_metadata.cp_history_seq_len = cp_history_seq_len
             metadata.seq_lens_cpu.copy_(next_seq_lens_cpu)
 
     def _calc_next_seq_lens_cpu(self, seq_lens_cpu, num_reqs, num_reqs_padded, step):

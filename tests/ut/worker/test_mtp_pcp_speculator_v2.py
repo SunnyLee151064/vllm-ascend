@@ -4,7 +4,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import pytest
@@ -555,3 +555,128 @@ def test_propose_preserves_v028_dp_token_counts() -> None:
     ):
         speculator.propose(input_batch, *[MagicMock() for _ in range(10)], token_counts, dp_sync=object())
     assert parent.call_args.args[11] is token_counts
+
+
+@pytest.mark.parametrize(
+    ("cp_rank", "expected_seq_lens", "expected_history_lens"),
+    [
+        (0, [4, 6, 0], [4, 5, 0]),
+        (1, [1, 4, 0], [0, 4, 0]),
+    ],
+)
+def test_mla_dcp_draft_metadata_updates_rank_local_lengths(
+    cp_rank: int,
+    expected_seq_lens: list[int],
+    expected_history_lens: list[int],
+) -> None:
+    speculator = object.__new__(AscendMTPSpeculator)
+    speculator.attn_architecture = "MLA"
+    speculator.block_tables = SimpleNamespace(
+        cp_size=2,
+        cp_rank=cp_rank,
+        cp_interleave=4,
+    )
+    speculator.max_model_len = 64
+    speculator._get_seq_lens_cpu = MagicMock(
+        return_value=torch.tensor([3, 8, 0], dtype=torch.int32)
+    )
+
+    decode_metadata = SimpleNamespace(
+        seq_lens_list=None,
+        actual_seq_lengths_q=None,
+        cp_seq_len=None,
+        cp_history_seq_len=None,
+    )
+    metadata = SimpleNamespace(
+        decode=decode_metadata,
+        seq_lens_cpu=torch.zeros(3, dtype=torch.int32),
+    )
+
+    speculator._update_decode_attn_metadata(
+        {"layer": metadata},
+        step=2,
+        num_reqs=2,
+    )
+
+    assert decode_metadata.seq_lens_list == [5, 10, 0]
+    assert decode_metadata.actual_seq_lengths_q == [1, 2, 3]
+    assert decode_metadata.cp_seq_len == expected_seq_lens
+    assert decode_metadata.cp_history_seq_len == expected_history_lens
+    torch.testing.assert_close(
+        metadata.seq_lens_cpu,
+        torch.tensor([5, 10, 0], dtype=torch.int32),
+    )
+
+
+def test_mla_dcp_graph_refreshes_each_draft_step() -> None:
+    speculator = object.__new__(AscendMTPSpeculator)
+    speculator.input_batch = SimpleNamespace(num_reqs=2)
+    speculator.draft_attn_layer_names = {"draft.layer"}
+    speculator.model_state = SimpleNamespace(
+        attn_metadata={"draft.layer": object()},
+    )
+    per_step_metadata = [object(), object(), object()]
+    speculator._init_decode_draft_attn_metadatas = MagicMock(
+        return_value=per_step_metadata
+    )
+    speculator._update_decode_attn_metadata = MagicMock()
+
+    actual = speculator.build_draft_attn_metadatas(
+        num_reqs_padded=2,
+        num_tokens_padded=2,
+        is_draft_model_prefill=False,
+    )
+
+    assert actual is per_step_metadata
+    assert speculator._update_decode_attn_metadata.call_args_list == [
+        call(per_step_metadata[0], 1, 2),
+        call(per_step_metadata[1], 2, 2),
+        call(per_step_metadata[2], 3, 2),
+    ]
+
+
+def test_mla_dcp_eager_draft_refreshes_metadata_before_forward() -> None:
+    speculator = object.__new__(AscendMTPSpeculator)
+    speculator.input_batch = SimpleNamespace(
+        is_prefilling_np=np.zeros(2, dtype=np.bool_),
+    )
+    speculator.input_buffers = SimpleNamespace(
+        positions=torch.arange(2, dtype=torch.int64),
+    )
+    speculator._update_decode_attn_metadata = MagicMock()
+    metadata = {
+        "layer": SimpleNamespace(
+            attn_state=None,
+        )
+    }
+
+    with (
+        patch.object(
+            speculator_module,
+            "build_draft_attn_metadata_factory",
+            return_value=nullcontext(),
+        ),
+        patch.object(
+            speculator_module.AutoRegressiveSpeculator,
+            "_build_draft_attn_metadata",
+            return_value=metadata,
+        ),
+    ):
+        actual = speculator._build_draft_attn_metadata(
+            num_reqs=2,
+            num_reqs_padded=2,
+            num_tokens_padded=2,
+            seq_lens_cpu_upper_bound=torch.tensor([3, 8], dtype=torch.int32),
+            step=2,
+        )
+
+    assert actual is metadata
+    assert (
+        metadata["layer"].attn_state
+        is speculator_module.AscendAttentionState.DecodeOnly
+    )
+    speculator._update_decode_attn_metadata.assert_called_once_with(
+        metadata,
+        2,
+        2,
+    )
