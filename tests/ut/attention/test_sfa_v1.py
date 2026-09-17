@@ -1047,6 +1047,92 @@ class TestAscendSFAImpl(TestBase):
                 self.assertEqual(events, [])
                 self.assertEqual(torch.count_nonzero(output).item(), 0)
 
+    def test_forward_trims_dp_padding_to_rope_tokens(self):
+        from vllm_ascend.attention import sfa_v1
+
+        model_hidden = torch.zeros(4, 4)
+        active_hidden = torch.zeros(3, 4)
+        metadata = SimpleNamespace(
+            cos=torch.zeros(3, 1, 1, self.impl.qk_rope_head_dim),
+            sin=torch.zeros(3, 1, 1, self.impl.qk_rope_head_dim),
+            slot_mapping=torch.arange(3),
+            num_input_tokens=3,
+            num_decode_tokens=3,
+            attn_state=AscendAttentionState.DecodeOnly,
+        )
+        context = SimpleNamespace(
+            actual_seq_lengths_query=torch.arange(1, 4),
+            actual_seq_lengths_key=torch.arange(1, 4),
+            kv_slot_mapping=metadata.slot_mapping,
+            gather_full_o_proj=False,
+            topk_num_tokens=3,
+        )
+        width = self.impl.q_lora_rank + self.impl.kv_lora_rank + self.impl.qk_rope_head_dim
+
+        for preprocess_type in (PreprocessType.NATIVE, PreprocessType.PROLOG_V3, PreprocessType.MLAPO):
+            with self.subTest(preprocess_type=preprocess_type):
+                self.impl.preprocess_type = preprocess_type
+                self.impl.has_indexer = True
+                self.impl._is_mtp_layer = True
+                self.impl.skip_topk = True
+                self.impl.g_proj = None
+                self.impl.layerwise_kv_cache_hook = None
+                self.impl._compose_sfa_kv_cache = lambda cache: cache
+                self.impl._get_sfa_kv_slot_mapping = lambda _: metadata.slot_mapping
+                self.impl._get_indexer_attn_metadata = lambda _: metadata
+                self.impl._get_parallel_forward_context = lambda *_args: context
+                self.impl._prepare_native_hidden_states = lambda x, _: x
+
+                projected_shapes = []
+
+                def project(x):
+                    projected_shapes.append(x.shape[0])
+                    return (torch.zeros(x.shape[0], width),)
+
+                self.impl.fused_qkv_a_proj = project
+                self.impl.q_a_layernorm = torch.nn.Identity()
+                self.impl.exec_kv = MagicMock(return_value=(active_hidden, active_hidden))
+                self.impl._prepare_kv_for_parallel = lambda *_args: (active_hidden, [])
+                self.impl._q_proj_and_k_up_proj = lambda _: (active_hidden, active_hidden)
+                self.impl.rope_single = lambda x, *_args: x
+                self.impl._record_query_gather_context = lambda *_args: None
+                self.impl._store_parallel_kv = lambda *_args: (active_hidden, active_hidden)
+
+                fused_hidden_shapes = []
+
+                def fused_preprocess(**kwargs):
+                    hidden = kwargs["hidden_states"]
+                    fused_hidden_shapes.append(hidden.shape[0])
+                    return hidden, active_hidden, active_hidden, active_hidden
+
+                self.impl._sfa_preprocess_prolog_v3 = fused_preprocess
+                self.impl._sfa_preprocess_mlapo = fused_preprocess
+                self.impl.indexer = MagicMock(return_value=torch.zeros(3, 1, dtype=torch.int64))
+                self.impl._get_indexcache_topk_indices = lambda _: torch.zeros(3, 1, dtype=torch.int64)
+                self.impl._execute_sparse_flash_attention_process = lambda *_args: torch.ones(3, 4)
+                self.impl._v_up_proj = lambda x: x
+                self.impl._finalize_o_proj = lambda x, output, _: output.copy_(x)
+                output = torch.empty_like(model_hidden)
+
+                with (
+                    patch.object(sfa_v1, "wait_for_kv_layer_from_connector"),
+                    patch.object(sfa_v1, "notify_kv_cache_written"),
+                    patch.object(sfa_v1, "record_attention_compute_start"),
+                    patch.object(sfa_v1, "maybe_save_kv_layer_to_connector"),
+                ):
+                    result = self.impl.forward("layer", model_hidden, (model_hidden,), metadata, output)
+
+                self.assertIs(result, output)
+                self.assertEqual(self.impl.indexer.call_args.args[0].shape[0], 3)
+                self.assertEqual(self.impl.indexer.call_args.args[4].shape[0], 3)
+                if preprocess_type == PreprocessType.NATIVE:
+                    self.assertEqual(projected_shapes, [3])
+                    self.assertEqual(self.impl.exec_kv.call_args.args[0].shape[0], 3)
+                else:
+                    self.assertEqual(fused_hidden_shapes, [3])
+                self.assertTrue(torch.all(output[:3] == 1))
+                self.assertTrue(torch.all(output[3:] == 0))
+
     def _setup_kv_b_proj(self):
         """Set up kv_b_proj with real weight tensor for process_weights_after_loading."""
         shape_0 = self.impl.num_heads * (self.impl.qk_nope_head_dim + self.impl.v_head_dim)
