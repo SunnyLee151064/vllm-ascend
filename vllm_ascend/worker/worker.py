@@ -761,6 +761,11 @@ class NPUWorker(WorkerBase):
             self.torch_allocated / GiB_bytes,
         )
 
+    def _wait_for_pending_pp_send(self) -> None:
+        for handle in self._pp_send_work:
+            handle.wait()
+        self._pp_send_work = []
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -770,10 +775,7 @@ class NPUWorker(WorkerBase):
         if get_ascend_config().msmonitor_use_daemon:
             dp.step()
 
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+        self._wait_for_pending_pp_send()
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -810,6 +812,13 @@ class NPUWorker(WorkerBase):
             output.tensors,
             all_gather_group=all_gather_group,
         )
+        if parallel_config.prefill_context_parallel_size > 1:
+            # PP and PCP use different HCCL communicators. Letting the PP send
+            # escape this step allows later PCP collectives to be enqueued
+            # before the send completes, which can leave the peer ranks waiting
+            # on different AIV operations. Keep ordinary PP asynchronous, but
+            # establish a completion boundary when PCP is active.
+            self._wait_for_pending_pp_send()
 
         # Align with upstream GPUWorker: Model Runner V2 has no
         # kv_connector_output to propagate from non-last PP ranks. Model Runner
