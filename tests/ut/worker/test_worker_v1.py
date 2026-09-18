@@ -1347,6 +1347,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
             worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
+            worker.vllm_config.parallel_config.prefill_context_parallel_size = 1
             worker.profiler = None
             worker._pp_send_work = []
 
@@ -1442,6 +1443,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
             worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
+            worker.vllm_config.parallel_config.prefill_context_parallel_size = 1
             worker.profiler = None
             worker._pp_send_work = []
 
@@ -2002,6 +2004,7 @@ class TestNPUWorker(TestBase):
             worker.vllm_config = MagicMock()
             worker.vllm_config.parallel_config = MagicMock()
             worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
+            worker.vllm_config.parallel_config.prefill_context_parallel_size = 1
             worker.profiler = None
             worker._pp_send_work = []
 
@@ -2038,6 +2041,50 @@ class TestNPUWorker(TestBase):
 
             # When both flags are False, return EMPTY_MODEL_RUNNER_OUTPUT directly.
             self.assertEqual(result, mock_empty_output)
+
+    @patch("vllm_ascend.worker.worker.get_ascend_config")
+    @patch("vllm_ascend.worker.worker.enable_sp", return_value=False)
+    @patch("vllm_ascend.worker.worker.get_pp_group")
+    @patch("vllm_ascend.worker.worker.get_tp_group")
+    def test_execute_model_waits_for_pp_send_with_pcp(
+        self, mock_get_tp_group, mock_get_pp_group, mock_enable_sp, mock_get_ascend_config
+    ):
+        from vllm.sequence import IntermediateTensors
+        from vllm_ascend.worker.worker import NPUWorker
+
+        mock_get_ascend_config.return_value.msmonitor_use_daemon = False
+
+        with patch.object(NPUWorker, "__init__", lambda x, **kwargs: None):
+            worker = NPUWorker()
+            worker.model_runner = MagicMock()
+            worker.use_v2_model_runner = True
+            worker.vllm_config = MagicMock()
+            worker.vllm_config.parallel_config.distributed_executor_backend = "ray"
+            worker.vllm_config.parallel_config.prefill_context_parallel_size = 2
+            worker.profiler = None
+            worker._pp_send_work = []
+
+            mock_pp_group = MagicMock()
+            mock_pp_group.is_first_rank = True
+            mock_pp_group.is_last_rank = False
+            mock_get_pp_group.return_value = mock_pp_group
+            send_handle = MagicMock()
+            mock_pp_group.isend_tensor_dict.return_value = [send_handle]
+
+            intermediate_output = MagicMock(spec=IntermediateTensors)
+            intermediate_output.tensors = {"output_tensor": "data"}
+            worker.model_runner.execute_model.return_value = intermediate_output
+            scheduler_output = MagicMock()
+            scheduler_output.total_num_scheduled_tokens = 1
+
+            self.assertIsNone(worker.execute_model(scheduler_output))
+
+            mock_pp_group.isend_tensor_dict.assert_called_once_with(
+                intermediate_output.tensors,
+                all_gather_group=mock_get_tp_group.return_value,
+            )
+            send_handle.wait.assert_called_once_with()
+            self.assertEqual(worker._pp_send_work, [])
 
     def test_update_config(self):
         """Test update_config delegates to model_runner.update_config"""
